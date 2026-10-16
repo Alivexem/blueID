@@ -1,0 +1,341 @@
+SUPER ADMIN - FRONTEND BUILD DIRECTIVE
+Cross River State Blue ID & Fisheries Information Management System
+Generated from the backend source on 2026-10-16. Role: SUPER_ADMIN.
+==============================================================================
+
+1. WHAT THIS ROLE IS
+------------------------------------------------------------------------------
+
+  Account administration and oversight. Nothing else.
+
+  Holds 4 of the 24 permissions. Reaches 35 of the 110 authenticated endpoints.
+  State-wide: sees all 18 LGAs, no LGA filter applied. Do not render an LGA switcher.
+  Rank 100 (highest). Rank decides WHO it can create, never WHAT it can do.
+
+  STATE_ADMIN is the operational role: 24 permissions, all 110 endpoints.
+  Anything to do with fishermen, assets, programmes or exports belongs there.
+
+2. PERMISSIONS (exactly these four)
+------------------------------------------------------------------------------
+
+  user:manage         Create, amend, activate, suspend operator accounts
+  user:assign_role    Set/change the role on an account (capped by rank)
+  audit:read          Audit trail + enumerator activity
+  dashboard:view      All dashboard and GIS surfaces
+
+  Not held: fisherman:read, fisherman:create, fisherman:edit,
+            fisherman:delete, fisherman:read_sensitive,
+            registration:verify, registration:status, duplicate:resolve,
+            duplicate:merge, asset:manage, asset:transfer,
+            programme:manage, benefit:allocate, benefit:approve,
+            benefit:deliver, cooperative:manage, community:manage,
+            device:manage, sync:submit, report:export
+
+3. ENDPOINTS THE SUPER ADMIN CAN CALL (35)
+------------------------------------------------------------------------------
+
+  [audit]
+  GET    /api/v1/audit/
+  GET    /api/v1/audit/:entityType/:entityId
+
+  [auth]
+  POST   /api/v1/auth/change-password
+  POST   /api/v1/auth/logout-all
+  GET    /api/v1/auth/sessions
+  POST   /api/v1/auth/users/:id/reset-password
+
+  [communities]
+  GET    /api/v1/communities/
+  GET    /api/v1/communities/:id
+  GET    /api/v1/communities/reference
+
+  [cooperatives]
+  GET    /api/v1/cooperatives/
+  GET    /api/v1/cooperatives/:id
+  GET    /api/v1/cooperatives/:id/members
+
+  [dashboard]
+  GET    /api/v1/dashboard/capacity
+  GET    /api/v1/dashboard/communities
+  GET    /api/v1/dashboard/enumerators
+  GET    /api/v1/dashboard/infrastructure-gaps
+  GET    /api/v1/dashboard/programmes
+  GET    /api/v1/dashboard/summary
+  GET    /api/v1/dashboard/trend
+
+  [gis]
+  GET    /api/v1/gis/communities
+  GET    /api/v1/gis/communities/:id
+  GET    /api/v1/gis/nearby
+  GET    /api/v1/gis/registration-points
+
+  [programmes]
+  GET    /api/v1/programmes/
+  GET    /api/v1/programmes/:id
+
+  [sync]
+  GET    /api/v1/sync/bootstrap
+  GET    /api/v1/sync/status
+
+  [users]
+  GET    /api/v1/users/
+  POST   /api/v1/users/
+  GET    /api/v1/users/:id
+  PATCH  /api/v1/users/:id
+  POST   /api/v1/users/:id/activate
+  PATCH  /api/v1/users/:id/status
+  GET    /api/v1/users/me
+  PATCH  /api/v1/users/me
+
+  Plus these, which need no token at all:
+  GET    /
+  GET    /api/v1/
+  POST   /api/v1/auth/forgot-password
+  POST   /api/v1/auth/login
+  POST   /api/v1/auth/logout
+  POST   /api/v1/auth/refresh
+  POST   /api/v1/auth/reset-password
+  GET    /api/v1/reference/constants
+  GET    /api/v1/verify/:blueId
+  GET    /api/v1/verify/:blueId/status-line
+  POST   /api/v1/verify/scan
+  GET    /docs/json
+  GET    /health/
+  GET    /health/live
+  GET    /health/ready
+
+4. BLOCKED - DO NOT RENDER THESE (75)
+------------------------------------------------------------------------------
+
+  Every one returns 403 MISSING_PERMISSION for this role.
+
+
+  [assets]
+  GET    /api/v1/assets/owner/:ownerId                        needs fisherman:read
+
+  [boats]
+  GET    /api/v1/boats/                                       needs fisherman:read
+  POST   /api/v1/boats/                                       needs asset:manage
+  DELETE /api/v1/boats/:id                                    needs asset:manage
+  GET    /api/v1/boats/:id                                    needs fisherman:read
+  PATCH  /api/v1/boats/:id                                    needs asset:manage
+  POST   /api/v1/boats/:id/photo                              needs asset:manage
+  POST   /api/v1/boats/:id/transfer                           needs asset:transfer
+
+  [communities]
+  POST   /api/v1/communities/                                 needs community:manage
+  DELETE /api/v1/communities/:id                              needs community:manage
+  PATCH  /api/v1/communities/:id                              needs community:manage
+  POST   /api/v1/communities/recalculate-stats                needs community:manage
+
+  [cooperatives]
+  POST   /api/v1/cooperatives/                                needs cooperative:manage
+  DELETE /api/v1/cooperatives/:id                             needs cooperative:manage
+  PATCH  /api/v1/cooperatives/:id                             needs cooperative:manage
+  POST   /api/v1/cooperatives/:id/members                     needs cooperative:manage
+  DELETE /api/v1/cooperatives/:id/members/:fishermanId        needs cooperative:manage
+  POST   /api/v1/cooperatives/recount-members                 needs cooperative:manage
+
+  [engines]
+  GET    /api/v1/engines/                                     needs fisherman:read
+  POST   /api/v1/engines/                                     needs asset:manage
+  DELETE /api/v1/engines/:id                                  needs asset:manage
+  GET    /api/v1/engines/:id                                  needs fisherman:read
+  PATCH  /api/v1/engines/:id                                  needs asset:manage
+  POST   /api/v1/engines/:id/photo                            needs asset:manage
+  POST   /api/v1/engines/:id/transfer                         needs asset:transfer
+
+  [equipment]
+  GET    /api/v1/equipment/                                   needs fisherman:read
+  POST   /api/v1/equipment/                                   needs asset:manage
+  DELETE /api/v1/equipment/:id                                needs asset:manage
+  GET    /api/v1/equipment/:id                                needs fisherman:read
+  PATCH  /api/v1/equipment/:id                                needs asset:manage
+  POST   /api/v1/equipment/:id/photo                          needs asset:manage
+  POST   /api/v1/equipment/:id/transfer                       needs asset:transfer
+
+  [fishermen]
+  GET    /api/v1/fishermen/                                   needs fisherman:read
+  POST   /api/v1/fishermen/                                   needs fisherman:create
+  DELETE /api/v1/fishermen/:id                                needs fisherman:delete
+  GET    /api/v1/fishermen/:id                                needs fisherman:read
+  PATCH  /api/v1/fishermen/:id                                needs fisherman:edit
+  GET    /api/v1/fishermen/:id/duplicates                     needs fisherman:read
+  POST   /api/v1/fishermen/:id/duplicates/resolve             needs duplicate:resolve
+  POST   /api/v1/fishermen/:id/photo                          needs fisherman:edit
+  GET    /api/v1/fishermen/:id/qr                             needs fisherman:read
+  POST   /api/v1/fishermen/:id/reissue-card                   needs registration:verify
+  PATCH  /api/v1/fishermen/:id/status                         needs registration:status
+  POST   /api/v1/fishermen/:id/verify                         needs registration:verify
+  GET    /api/v1/fishermen/blue-id/:blueId                    needs fisherman:read
+  POST   /api/v1/fishermen/check-duplicates                   needs fisherman:create
+
+  [media]
+  GET    /api/v1/media/signed-url                             needs fisherman:read
+  POST   /api/v1/media/upload                                 needs fisherman:edit
+  POST   /api/v1/media/upload-signature                       needs fisherman:edit
+
+  [programmes]
+  POST   /api/v1/programmes/                                  needs programme:manage
+  DELETE /api/v1/programmes/:id                               needs programme:manage
+  PATCH  /api/v1/programmes/:id                               needs programme:manage
+  POST   /api/v1/programmes/:id/allocations                   needs benefit:allocate
+  GET    /api/v1/programmes/:id/eligible                      needs benefit:allocate
+  GET    /api/v1/programmes/:id/eligible/:fishermanId         needs benefit:allocate
+  PATCH  /api/v1/programmes/:id/status                        needs programme:manage
+  GET    /api/v1/programmes/allocations                       needs fisherman:read
+  POST   /api/v1/programmes/allocations/:allocationId/deliver needs benefit:deliver
+  PATCH  /api/v1/programmes/allocations/:allocationId/status  needs benefit:approve
+  GET    /api/v1/programmes/beneficiaries/:fishermanId        needs fisherman:read
+
+  [reports]
+  GET    /api/v1/reports/boats.csv                            needs report:export
+  GET    /api/v1/reports/engines.csv                          needs report:export
+  GET    /api/v1/reports/programmes/:id/beneficiaries.csv     needs report:export
+  GET    /api/v1/reports/register.csv                         needs report:export
+  GET    /api/v1/reports/register.xlsx                        needs report:export
+  GET    /api/v1/reports/statistics.xlsx                      needs report:export
+  GET    /api/v1/reports/summary.pdf                          needs report:export
+
+  [sync]
+  GET    /api/v1/sync/batches                                 needs device:manage
+  GET    /api/v1/sync/batches/:id                             needs device:manage
+  GET    /api/v1/sync/batches/:id/rejected                    needs device:manage
+  GET    /api/v1/sync/devices                                 needs device:manage
+  POST   /api/v1/sync/devices                                 needs device:manage
+  POST   /api/v1/sync/devices/:id/revoke                      needs device:manage
+  GET    /api/v1/sync/pull                                    needs fisherman:read
+  POST   /api/v1/sync/push                                    needs sync:submit
+
+5. HOW THE ACCOUNT EXISTS
+------------------------------------------------------------------------------
+
+  Created on the server only:
+
+    npm run create:admin -- --email=x@crossriverstate.gov.ng \
+                            --first=Ada --last=Effiom \
+                            --role=SUPER_ADMIN
+
+  There is NO API route that creates a SUPER_ADMIN. Account creation refuses
+  any role at or above the caller's own rank, so even a Super Admin cannot
+  create another one.
+
+  => The role dropdown must NEVER list SUPER_ADMIN. The request always fails.
+
+6. FIRST LOGIN - MANDATORY HANDLING
+------------------------------------------------------------------------------
+
+  POST /api/v1/auth/login returns mustChangePassword: true on an account
+  using a password it was issued rather than chose.
+
+  While that flag is true the token reaches ONLY these five:
+
+    POST /api/v1/auth/change-password
+    POST /api/v1/auth/logout
+    POST /api/v1/auth/logout-all
+    GET  /api/v1/auth/sessions
+    GET  /api/v1/users/me
+
+  Everything else returns 403 PASSWORD_CHANGE_REQUIRED.
+
+  => Branch on mustChangePassword immediately after login and route to the
+     change-password screen BEFORE loading any dashboard data. A dashboard
+     that fetches its widgets first will get a wall of 403s.
+
+  After a successful change every session is revoked, including the current
+  one. Send the user back to the login screen.
+
+7. LOGIN RESPONSE
+------------------------------------------------------------------------------
+
+  POST /api/v1/auth/login
+  {
+    "accessToken":       "<JWT, send as Authorization: Bearer ...>",
+    "refreshToken":      "<opaque, rotated on every use, store securely>",
+    "tokenType":         "Bearer",
+    "expiresIn":         "15m",
+    "refreshExpiresAt":  "<ISO date>",
+    "mustChangePassword": false,
+    "user": { "id", "email", "firstName", "lastName", "role", "status", "scope" }
+  }
+
+  Access token lasts 15 minutes. On 401 TOKEN_EXPIRED call
+  POST /api/v1/auth/refresh with the refresh token and retry once.
+  Refresh tokens rotate: always store the new one. Reusing an old one
+  revokes the whole session family and forces a fresh login.
+
+8. GET /api/v1/users/me - DRIVE THE NAVIGATION FROM THIS
+------------------------------------------------------------------------------
+
+  For a SUPER_ADMIN it returns:
+
+    permissions: {
+      isStateWide:          true,
+      canManageUsers:       true,
+      canReadAudit:         true,
+      canVerify:            false,
+      canManageProgrammes:  false,
+      canExport:            false,
+      canRegisterDevices:   false,
+      canReadRegister:      false,
+      granted: ["user:manage","user:assign_role","audit:read","dashboard:view"]
+    }
+    lgas: []        // empty, but isStateWide true means no filter is applied
+
+  Use `granted` for anything the seven booleans do not cover. Every flag is
+  read from the same permission set the routes are guarded on, so a true flag
+  means the call will succeed.
+
+9. ROLE PICKER RULES (POST /api/v1/users, PATCH /api/v1/users/:id)
+------------------------------------------------------------------------------
+
+  Ranks: SUPER_ADMIN 100, STATE_ADMIN 90, MINISTRY_OFFICER 80,
+         LGA_ADMIN 60, COOPERATIVE_OFFICER 40, ENUMERATOR 20
+
+  Rule: you may only assign a role STRICTLY BELOW your own rank.
+
+  A Super Admin may therefore create:
+    STATE_ADMIN, MINISTRY_OFFICER, LGA_ADMIN, COOPERATIVE_OFFICER,
+    ENUMERATOR
+
+  Never offer SUPER_ADMIN. Filter the dropdown by the signed-in user's rank
+  rather than hard-coding the list, so it stays correct for other roles.
+
+  Other constraints:
+    - COOPERATIVE_OFFICER requires a `cooperative` id, else 400.
+    - Omit `password` and the server generates one, returned ONCE in the
+      response as `temporaryPassword`. It is not recoverable. Show it once
+      and tell the admin to pass it on.
+    - Every account created this way is flagged mustChangePassword, including
+      when the admin supplies the password.
+    - You cannot change your own role.
+    - You cannot change your own account status.
+
+10. ERROR CODES TO HANDLE
+------------------------------------------------------------------------------
+
+  401 TOKEN_MISSING             no Authorization header
+  401 TOKEN_EXPIRED             refresh and retry once
+  401 TOKEN_INVALID             sign out
+  401 WRONG_TOKEN_TYPE          a refresh token was sent as an access token
+  401 SESSION_REVOKED           signed out elsewhere, or password changed
+  401 INVALID_CREDENTIALS       login failed (cause is deliberately not given)
+  423 ACCOUNT_LOCKED            8 failed logins; locked 15 minutes
+  403 PASSWORD_CHANGE_REQUIRED  temporary password still in use (section 6)
+  403 MISSING_PERMISSION        role lacks the capability; do not retry
+  403 ACCOUNT_INACTIVE          suspended or disabled
+  403 ACCOUNT_PENDING           awaiting approval
+  404 NOT_FOUND                 also returned instead of 403 when a record is
+                                outside the caller's scope - do not infer that
+                                the record does not exist
+  409 EMAIL_TAKEN               account already exists
+  422 VALIDATION_ERROR          field errors in `details`
+  429 RATE_LIMITED              login is 10/15min per IP, reset 5/hr per IP
+
+  All errors share one shape:
+    { "success": false, "error": { "code", "message", "details"?, "requestId" } }
+
+  Branch on `code`, never on `message`.
+
+------------------------------------------------------------------------------
+Swagger: GET /docs  (JSON at /docs/json) - all 96 paths, 122 operations.
