@@ -72,9 +72,20 @@ const schema = z
     /** Publish /docs without the probe key (fine for staging). */
     DOCS_PUBLIC: bool(false),
 
-    MONGODB_URI: z.string().min(1, 'MONGODB_URI is required'),
-    MONGODB_MAX_POOL_SIZE: int(20),
-    MONGODB_MIN_POOL_SIZE: int(2),
+    DATABASE_URL: z.string().min(1, 'DATABASE_URL is required'),
+    DATABASE_POOL_MAX: int(20),
+    DATABASE_POOL_MIN: int(2),
+    /** A query still running after this is cancelled rather than held. */
+    DATABASE_STATEMENT_TIMEOUT_MS: int(30_000),
+    /**
+     * TLS to the database. When Postgres runs on the same host as the API and
+     * listens only on the loopback interface, the traffic never reaches a
+     * network and TLS buys nothing — so this defaults off and the production
+     * check below accepts either arrangement.
+     */
+    DATABASE_SSL: bool(false),
+    DATABASE_SSL_REJECT_UNAUTHORIZED: bool(true),
+    DATABASE_SSL_CA_PATH: z.string().default(''),
 
     CACHE_PREFIX: z.string().default('blueid'),
     CACHE_TTL_SECONDS: int(300),
@@ -315,18 +326,30 @@ const schema = z
      * line to say so.
      */
     /**
-     * The register carries identities, NINs and photographs. An unencrypted
-     * database connection would expose all of it to anything on the network
-     * path, so production requires TLS — which `mongodb+srv://` implies and
-     * `tls=true` states explicitly.
+     * The register carries identities, NINs and photographs, so the database
+     * connection must not be readable on the wire.
+     *
+     * Two arrangements are safe: the database on the same host reached over
+     * loopback, where there is no wire; or a remote database with TLS. A
+     * remote host without TLS is neither, and is refused.
      */
-    if (isProd && !/^mongodb\+srv:\/\//.test(env.MONGODB_URI) && !/[?&]tls=true/.test(env.MONGODB_URI)) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['MONGODB_URI'],
-        message:
-          'The production MongoDB connection must use TLS (mongodb+srv:// or tls=true)',
-      });
+    if (isProd && !env.DATABASE_SSL) {
+      const host = (() => {
+        try {
+          return new URL(env.DATABASE_URL).hostname;
+        } catch {
+          return '';
+        }
+      })();
+      const isLoopback = ['localhost', '127.0.0.1', '::1', ''].includes(host);
+      if (!isLoopback) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['DATABASE_SSL'],
+          message:
+            `The production database is at "${host}", which is not loopback, so DATABASE_SSL must be true`,
+        });
+      }
     }
     if (isProd && env.CORS_ORIGINS.includes('*')) {
       ctx.addIssue({
@@ -370,34 +393,14 @@ const config = {
 
   log: { level: env.LOG_LEVEL },
 
-  mongo: {
-    uri: env.MONGODB_URI,
-    options: {
-      maxPoolSize: env.MONGODB_MAX_POOL_SIZE,
-      minPoolSize: env.MONGODB_MIN_POOL_SIZE,
-      serverSelectionTimeoutMS: 10_000,
-      /**
-       * Fail fast instead of queuing.
-       *
-       * With buffering on (the default), a query issued while the database is
-       * unreachable sits in memory for 10 seconds and then surfaces as an
-       * opaque 500 "buffering timed out". Disabling it turns the same
-       * situation into an immediate, honest 503.
-       */
-      bufferCommands: false,
-      socketTimeoutMS: 45_000,
-      heartbeatFrequencyMS: 10_000,
-      // Writes must reach a majority before they are acknowledged — the
-      // register must not lose a registration to a primary failover.
-      writeConcern: { w: 'majority', journal: true },
-      retryWrites: true,
-      retryReads: true,
-      /**
-       * Index creation is an explicit, reviewed deploy step in production
-       * (`npm run db:indexes`), never a side effect of a process starting.
-       */
-      autoIndex: env.NODE_ENV !== 'production',
-    },
+  database: {
+    url: env.DATABASE_URL,
+    poolMax: env.DATABASE_POOL_MAX,
+    poolMin: env.DATABASE_POOL_MIN,
+    statementTimeoutMs: env.DATABASE_STATEMENT_TIMEOUT_MS,
+    ssl: env.DATABASE_SSL,
+    sslRejectUnauthorized: env.DATABASE_SSL_REJECT_UNAUTHORIZED,
+    sslCaPath: env.DATABASE_SSL_CA_PATH,
   },
 
   cache: {

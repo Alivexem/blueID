@@ -1,170 +1,301 @@
 'use strict';
 
-const mongoose = require('mongoose');
+const fs = require('node:fs');
+const path = require('node:path');
+const { Pool, types } = require('pg');
 const config = require('./index');
 const logger = require('./logger');
 
 /**
- * MongoDB is the system of record. The process should not serve traffic
- * without it, so connect() throws and the server exits on failure.
- */
-
-mongoose.set('strictQuery', true);
-
-/**
- * `sanitizeFilter` is deliberately NOT enabled.
+ * PostgreSQL connection and transaction handling.
  *
- * It looks like the obvious defence against operator injection, but it
- * rewrites EVERY object value containing a `$` key into `{ $eq: ... }` —
- * including the ones this codebase writes itself. A filter as ordinary as
- * `{ isDeleted: { $ne: true } }` becomes `{ isDeleted: { $eq: { $ne: true } } }`
- * and then fails to cast, so essentially every list query, scope filter and
- * soft-delete exclusion in the application throws. Using it correctly would
- * require wrapping every internal operator in `mongoose.trusted()` at well
- * over a hundred call sites, where a single omission silently disables a
- * filter.
+ * WHY POSTGRES, AND WHY SELF-HOSTED
  *
- * Injection is prevented at the boundary instead, which is both stronger and
- * verifiable:
+ * The register holds identity data about Nigerian citizens — names, dates of
+ * birth, NINs and photographs. NITDA's National Cloud Policy places that in a
+ * tier which must be stored in Nigeria at rest, and no managed MongoDB
+ * service operates in-country. The database therefore runs on the same
+ * Nigerian server as the application, which also makes the concept note's
+ * stated preference for a relational database the easy choice rather than a
+ * compromise.
  *
- *   - every request body, query and param is parsed by zod, which coerces to
- *     typed scalars and strips unknown keys, so an object can never arrive
- *     where a string is expected (see middleware/validate.js);
- *   - filters are assembled from allowlists, never spread from user input
- *     (see utils/query.js);
- *   - `assertScalar` is the backstop for any internally-built filter value.
+ * WHAT CHANGED FROM MONGODB
  *
- * test/injection.test.js proves an injected operator object is rejected.
+ * Transactions stop being conditional. The previous driver had to detect at
+ * runtime whether the deployment was a replica set and silently fall back to
+ * non-transactional writes on a standalone — a fallback that quietly removed
+ * the atomicity the register depends on. Here a transaction is always a
+ * transaction.
  */
 
 /**
- * Fail fast instead of queuing.
+ * Return bigint as a Number rather than a string.
  *
- * Set GLOBALLY rather than only as a connect option: models are compiled when
- * their modules are required, which happens before `connect()` runs, so a
- * query issued in that window still buffered — sitting in memory for ten
- * seconds before surfacing as an opaque timeout. Setting it here covers every
- * model regardless of when it was compiled.
+ * Only `counters.seq` is a bigint, and it holds a Blue ID sequence that will
+ * not pass 2^53 before the sun burns out. Everything else is integer. Without
+ * this the sequence arrives as "41" and `41 + 1` becomes "411".
  */
-mongoose.set('bufferCommands', false);
+types.setTypeParser(types.builtins.INT8, (value) => (value === null ? null : Number(value)));
 
+/**
+ * NUMERIC arrives as a string by default, because arbitrary precision does
+ * not fit a double. The values here are boat lengths, horsepower and naira
+ * amounts, all well inside a float, and the application treats them as
+ * numbers throughout.
+ */
+types.setTypeParser(types.builtins.NUMERIC, (value) => (value === null ? null : Number(value)));
+
+/**
+ * DATE (not timestamptz) is a calendar day — a date of birth. Returning a
+ * JS Date applies the server's timezone and can shift it a day, so it stays
+ * the ISO string Postgres gives us.
+ */
+types.setTypeParser(types.builtins.DATE, (value) => value);
+
+let pool = null;
 let connected = false;
 
+function buildPoolConfig() {
+  const ssl = config.database.ssl
+    ? {
+        rejectUnauthorized: config.database.sslRejectUnauthorized,
+        ...(config.database.sslCaPath && fs.existsSync(config.database.sslCaPath)
+          ? { ca: fs.readFileSync(config.database.sslCaPath, 'utf8') }
+          : {}),
+      }
+    : false;
+
+  return {
+    connectionString: config.database.url,
+    ssl,
+    max: config.database.poolMax,
+    min: config.database.poolMin,
+    idleTimeoutMillis: 30_000,
+    // Fail a connection attempt rather than queueing behind a dead server.
+    connectionTimeoutMillis: 10_000,
+    // A query that has not finished in this long is not going to; cancelling
+    // it frees the connection instead of holding the pool hostage.
+    statement_timeout: config.database.statementTimeoutMs,
+    application_name: 'blueid-api',
+  };
+}
+
 async function connect() {
-  if (connected) return mongoose.connection;
+  if (pool) return pool;
 
-  mongoose.connection.on('connected', () => {
+  pool = new Pool(buildPoolConfig());
+
+  /**
+   * An idle client erroring is normal — the server restarted, a firewall
+   * dropped it. Without a handler, `pg` raises it as an uncaught exception
+   * and takes the process down.
+   */
+  pool.on('error', (err) => {
+    logger.error({ err }, 'Idle database client errored; it will be replaced');
+  });
+
+  const started = Date.now();
+  const client = await pool.connect();
+  try {
+    const { rows } = await client.query(
+      "SELECT current_database() AS db, current_setting('server_version') AS version"
+    );
     connected = true;
-    logger.info({ db: mongoose.connection.name }, 'MongoDB connected');
-  });
-  mongoose.connection.on('disconnected', () => {
-    connected = false;
-    logger.warn('MongoDB disconnected');
-  });
-  mongoose.connection.on('error', (err) => {
-    logger.error({ err }, 'MongoDB connection error');
-  });
+    logger.info(
+      { database: rows[0].db, version: rows[0].version, ms: Date.now() - started },
+      'PostgreSQL connected'
+    );
+  } finally {
+    client.release();
+  }
 
-  await mongoose.connect(config.mongo.uri, config.mongo.options);
-  return mongoose.connection;
+  return pool;
 }
 
 async function disconnect() {
-  if (mongoose.connection.readyState === 0) return;
-  await mongoose.disconnect();
+  if (!pool) return;
+  await pool.end();
+  pool = null;
   connected = false;
-  logger.info('MongoDB connection closed');
+  logger.info('PostgreSQL disconnected');
 }
 
-/** readyState 1 === connected. Used by /health. */
-function isHealthy() {
-  return mongoose.connection.readyState === 1;
+function getPool() {
+  if (!pool) {
+    throw new Error('Database not connected — call connect() during boot');
+  }
+  return pool;
+}
+
+/**
+ * Runs a query against the pool, or against the open transaction if one is
+ * in scope. Every repository goes through here, which is what lets a service
+ * compose calls into a transaction without threading a client argument
+ * through every function signature.
+ */
+function query(text, params, client) {
+  return (client || getPool()).query(text, params);
+}
+
+/**
+ * Runs `fn` inside a transaction, handing it a client to use.
+ *
+ * Unlike the MongoDB version this replaced, there is no capability detection
+ * and no fallback: a single Postgres server supports transactions, so a
+ * failure here is a real failure rather than a reason to proceed unsafely.
+ *
+ * Nested calls join the outer transaction rather than opening a second one,
+ * so a service that calls another service does not deadlock against itself.
+ */
+async function withTransaction(fn, existingClient) {
+  if (existingClient) return fn(existingClient);
+
+  const client = await getPool().connect();
+  try {
+    await client.query('BEGIN');
+    const result = await fn(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackErr) {
+      // A rollback that fails means the connection is already broken; the
+      // original error is the one worth reporting.
+      logger.error({ err: rollbackErr }, 'Rollback failed');
+    }
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Serialises work across instances using a PostgreSQL advisory lock.
+ *
+ * This is what the in-process cache lock cannot do. The sync pipeline uses it
+ * so one device's batch is never processed twice concurrently; because the
+ * lock lives in the database rather than in a process, it stays correct if
+ * the deployment is ever scaled beyond one instance.
+ *
+ * The lock is held on a dedicated connection and released in `finally`, and
+ * Postgres drops it automatically if the connection dies — so a crashed
+ * process cannot wedge the pipeline.
+ */
+async function withAdvisoryLock(key, fn, { waitMs = 0 } = {}) {
+  const client = await getPool().connect();
+  // Hash the name to the bigint the advisory-lock functions take.
+  const lockId = hashLockKey(key);
+
+  try {
+    if (waitMs > 0) {
+      await client.query(`SET LOCAL lock_timeout = '${Math.ceil(waitMs)}ms'`);
+      await client.query('SELECT pg_advisory_lock($1)', [lockId]);
+    } else {
+      const { rows } = await client.query('SELECT pg_try_advisory_lock($1) AS acquired', [lockId]);
+      if (!rows[0].acquired) return { acquired: false, result: undefined };
+    }
+
+    const result = await fn();
+    return { acquired: true, result };
+  } finally {
+    await client.query('SELECT pg_advisory_unlock($1)', [lockId]).catch(() => {});
+    client.release();
+  }
+}
+
+/** FNV-1a folded into a signed 64-bit range for pg_advisory_lock. */
+function hashLockKey(key) {
+  const str = String(key);
+  let hash = 0xcbf29ce484222325n;
+  for (let i = 0; i < str.length; i += 1) {
+    hash ^= BigInt(str.charCodeAt(i));
+    hash = BigInt.asUintN(64, hash * 0x100000001b3n);
+  }
+  return BigInt.asIntN(64, hash).toString();
 }
 
 async function ping() {
   const started = Date.now();
-  await mongoose.connection.db.admin().command({ ping: 1 });
+  await query('SELECT 1');
   return Date.now() - started;
 }
 
-/**
- * Runs `fn` inside a transaction when the deployment supports them (replica
- * set / Atlas) and falls back to a plain call on a standalone dev mongod.
- * Sync batches use this so a partially-applied batch cannot be left behind.
- */
-/**
- * Cached transaction capability: null = not yet determined.
- *
- * This was previously probed with `client.topology.hasSessionSupport()`, a
- * method the modern driver no longer exposes. The optional call returned
- * `undefined`, `Boolean(undefined)` was false, and so EVERY call ran its
- * callback outside a transaction — on a replica set where transactions work
- * perfectly. Blue ID issuance, duplicate merges, benefit allocation and the
- * outbox write were all silently non-atomic.
- *
- * Capability is now established by attempting a real transaction and reading
- * the server's answer, which cannot drift from what the driver actually does.
- */
-let transactionsSupported = null;
-
-/** Does this error mean the deployment cannot do transactions at all? */
-function isUnsupportedTransaction(err) {
-  if (!err) return false;
-  // IllegalOperation, raised by a standalone mongod.
-  if (err.code === 20) return true;
-  return /transaction numbers are only allowed|does not support transactions|transactions are not supported/i.test(
-    err.message || ''
-  );
+function isConnected() {
+  return connected;
 }
 
-async function withTransaction(fn) {
-  if (transactionsSupported === false) {
-    return fn(null);
-  }
+/**
+ * Applies any migration files that have not run yet.
+ *
+ * Deliberately plain SQL files applied in filename order, each inside its own
+ * transaction, with the applied set recorded in a table. A migration tool
+ * would add a dependency and a DSL for something this system needs to do
+ * rarely and legibly — and an operator restoring a backup on a Nigerian VPS
+ * at 2am should be able to read exactly what ran.
+ */
+async function migrate({ directory = path.join(__dirname, '..', 'db', 'migrations') } = {}) {
+  await query(`
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      filename   text PRIMARY KEY,
+      applied_at timestamptz NOT NULL DEFAULT now(),
+      checksum   text
+    )
+  `);
 
-  const session = await mongoose.startSession();
+  const files = fs
+    .readdirSync(directory)
+    .filter((f) => f.endsWith('.sql'))
+    .sort();
 
-  try {
-    let result;
-    await session.withTransaction(async () => {
-      result = await fn(session);
-    });
-    transactionsSupported = true;
-    return result;
-  } catch (err) {
-    /**
-     * Only fall back on the FIRST attempt, and only for a genuine capability
-     * error. A standalone rejects at the first write inside the transaction,
-     * so nothing has been committed and re-running is safe. Any other failure
-     * propagates — quietly retrying an arbitrary error outside a transaction
-     * is how half-applied writes happen.
-     */
-    if (transactionsSupported === null && isUnsupportedTransaction(err)) {
-      transactionsSupported = false;
-      logger.error(
-        { err: { message: err.message, code: err.code } },
-        'This MongoDB deployment does not support transactions — multi-document operations ' +
-          'will run WITHOUT atomicity. Use a replica set in production.'
-      );
-      return fn(null);
+  const { rows } = await query('SELECT filename, checksum FROM schema_migrations');
+  const applied = new Map(rows.map((r) => [r.filename, r.checksum]));
+  const ran = [];
+
+  for (const filename of files) {
+    const sql = fs.readFileSync(path.join(directory, filename), 'utf8');
+    const checksum = require('node:crypto').createHash('sha256').update(sql).digest('hex').slice(0, 16);
+
+    if (applied.has(filename)) {
+      /**
+       * An applied migration that has since been edited means the database
+       * and the repository disagree about what the schema is. Refusing is
+       * the only safe answer — silently ignoring it is how two environments
+       * drift apart without anyone noticing.
+       */
+      if (applied.get(filename) && applied.get(filename) !== checksum) {
+        throw new Error(
+          `Migration ${filename} has changed since it was applied. ` +
+            'Add a new migration instead of editing one that has run.'
+        );
+      }
+      continue;
     }
-    throw err;
-  } finally {
-    await session.endSession();
-  }
-}
 
-/** Exposed for tests and for the readiness probe. */
-function transactionSupportState() {
-  return transactionsSupported;
+    // eslint-disable-next-line no-await-in-loop
+    await withTransaction(async (client) => {
+      await client.query(sql);
+      await client.query('INSERT INTO schema_migrations (filename, checksum) VALUES ($1, $2)', [
+        filename,
+        checksum,
+      ]);
+    });
+
+    ran.push(filename);
+    logger.info({ migration: filename }, 'Migration applied');
+  }
+
+  return ran;
 }
 
 module.exports = {
   connect,
   disconnect,
-  isHealthy,
-  ping,
+  getPool,
+  query,
   withTransaction,
-  transactionSupportState,
-  mongoose,
+  withAdvisoryLock,
+  migrate,
+  ping,
+  isConnected,
 };
