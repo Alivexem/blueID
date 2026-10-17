@@ -1,6 +1,6 @@
 'use strict';
 
-const User = require('./user.model');
+const users = require('./user.repository');
 const firebase = require('../../config/firebase');
 const passwordUtil = require('../../utils/password');
 const authService = require('../auth/auth.service');
@@ -8,7 +8,7 @@ const auditService = require('../../services/audit.service');
 const emailService = require('../../services/email.service');
 const ApiError = require('../../utils/ApiError');
 const logger = require('../../config/logger');
-const { paginate, resolvePagination } = require('../../utils/pagination');
+const { resolvePagination } = require('../../utils/pagination');
 const {
   rankOf,
   isStateWide,
@@ -75,7 +75,7 @@ async function invite(payload, actor, options = {}) {
   assertCanAssignRole(actor, payload.role);
   assertCanManage(actor, payload.role, payload.scope?.lgas || []);
 
-  const existing = await User.findOne({ email: payload.email.toLowerCase() });
+  const existing = await users.findByEmail(payload.email);
   if (existing) {
     throw ApiError.conflict('An account with that email address already exists', {
       code: 'EMAIL_TAKEN',
@@ -103,7 +103,7 @@ async function invite(payload, actor, options = {}) {
     authService.assertPasswordAcceptable(payload.password, payload);
   }
 
-  const user = await User.create({
+  const user = await users.create({
     ...payload,
     password: undefined,
     email: payload.email.toLowerCase(),
@@ -145,55 +145,38 @@ async function invite(payload, actor, options = {}) {
 
 async function list(query, actor) {
   const pagination = resolvePagination(query);
-  const filter = { isDeleted: { $ne: true } };
 
-  if (query.role) filter.role = query.role;
-  if (query.status) filter.status = query.status;
-  if (query.lga) filter['scope.lgas'] = query.lga;
-  if (query.search) {
-    const term = escapeRegex(query.search);
-    filter.$or = [
-      { firstName: new RegExp(term, 'i') },
-      { lastName: new RegExp(term, 'i') },
-      { email: new RegExp(term, 'i') },
-    ];
-  }
-
-  // An LGA administrator sees only the staff working in their own LGAs.
-  if (!isStateWide(actor)) {
-    filter['scope.lgas'] = { $in: scopedLgas(actor) };
-  }
-
-  return paginate(User, filter, pagination, {
-    sort: { createdAt: -1 },
-    populate: [
-      { path: 'invitedBy', select: 'firstName lastName' },
-      { path: 'cooperative', select: 'name lga' },
-    ],
+  return users.list({
+    page: pagination.page,
+    limit: pagination.limit,
+    role: query.role,
+    status: query.status,
+    lga: query.lga,
+    search: query.search,
+    // An LGA administrator sees only staff working in their own areas. The
+    // filter goes into the SQL rather than being applied after loading, so a
+    // page of results cannot be mostly rows the caller may not see.
+    scopeLgas: isStateWide(actor) ? undefined : scopedLgas(actor),
   });
 }
 
 async function getById(id, actor, { includeIdentity = false } = {}) {
-  const user = await User.findOne({ _id: id, isDeleted: { $ne: true } })
-    .populate('invitedBy', 'firstName lastName email')
-    .populate('cooperative', 'name lga')
-    .populate('scope.communities', 'name lga');
+  const user = await users.findById(id);
   if (!user) throw ApiError.notFound('User not found');
 
-  if (!isStateWide(actor) && String(user._id) !== String(actor._id)) {
+  if (!isStateWide(actor) && String(user.id) !== String(actor.id)) {
     const overlap = (user.scope?.lgas || []).some((lga) => scopedLgas(actor).includes(lga));
     if (!overlap) throw ApiError.forbidden('That user is outside your scope');
   }
 
   /**
-   * The identity-provider view: is the account disabled, is its email
-   * verified, when did it last sign in. Useful when an administrator is
-   * investigating why someone cannot get in, and it comes from Firebase
-   * rather than being mirrored (and going stale) here.
+   * The identity-provider view, for an administrator investigating why
+   * someone cannot sign in. Read live rather than mirrored here, so it
+   * cannot go stale. Only relevant in the external-identity modes.
    */
   if (includeIdentity && user.authUid) {
     const identity = await firebase.getUser(user.authUid);
-    return { ...user.toJSON(), identity };
+    return { ...user, identity };
   }
 
   return user;
@@ -202,7 +185,7 @@ async function getById(id, actor, { includeIdentity = false } = {}) {
 async function update(id, payload, actor, options = {}) {
   const { req } = options;
   const user = await getById(id, actor);
-  const before = user.toObject();
+  const before = { ...user };
 
   // Role and scope changes are privileged; profile fields are not.
   if (payload.role && payload.role !== user.role) {
@@ -212,56 +195,57 @@ async function update(id, payload, actor, options = {}) {
   if (payload.scope) {
     assertCanManage(actor, payload.role || user.role, payload.scope.lgas || []);
   }
-  if (String(user._id) === String(actor._id) && payload.role) {
+  if (String(user.id) === String(actor.id) && payload.role) {
     throw ApiError.forbidden('You cannot change your own role');
   }
 
   // `authUid` is set by the authentication flow, never by an administrator.
   delete payload.authUid;
 
-  Object.assign(user, payload);
-  await user.save();
+  const updated = await users.update(user.id, payload);
 
-  const roleChanged = before.role !== user.role;
+  const roleChanged = before.role !== updated.role;
   await auditService.record({
     action: roleChanged ? AUDIT_ACTIONS.ROLE_CHANGE : AUDIT_ACTIONS.UPDATE,
-    entity: { type: 'User', id: user._id, label: user.fullName },
-    changes: auditService.diff(before, user.toObject()),
+    entity: { type: 'User', id: updated.id, label: updated.fullName },
+    changes: auditService.diff(before, updated),
     req,
   });
 
-  return user;
+  return updated;
 }
 
 /** Approves an auto-provisioned account that is waiting for a role. */
 async function activate(id, { role, scope }, actor, options = {}) {
   const { req } = options;
-  const user = await User.findById(id);
+  const user = await users.findById(id);
   if (!user) throw ApiError.notFound('User not found');
 
   if (role && role !== user.role) assertCanAssignRole(actor, role);
   assertCanManage(actor, role || user.role, scope?.lgas || user.scope?.lgas || []);
 
-  const before = user.toObject();
-  if (role) user.role = role;
-  if (scope) user.scope = scope;
-  user.status = USER_STATUS.ACTIVE;
-  await user.save();
+  const before = { ...user };
+  const updated = await users.update(user.id, {
+    ...(role ? { role } : {}),
+    ...(scope ? { scope } : {}),
+    status: USER_STATUS.ACTIVE,
+    activatedAt: new Date(),
+  });
 
   await auditService.record({
     action: AUDIT_ACTIONS.ROLE_CHANGE,
-    entity: { type: 'User', id: user._id, label: user.fullName },
-    changes: auditService.diff(before, user.toObject()),
+    entity: { type: 'User', id: updated.id, label: updated.fullName },
+    changes: auditService.diff(before, updated),
     req,
   });
 
-  if (user.email) {
+  if (updated.email) {
     emailService
-      .sendAccountActivated({ to: user.email, name: user.fullName, role: user.role })
+      .sendAccountActivated({ to: updated.email, name: updated.fullName, role: updated.role })
       .catch(() => {});
   }
 
-  return user;
+  return updated;
 }
 
 async function changeStatus(id, { status, reason }, actor, options = {}) {
@@ -275,9 +259,8 @@ async function changeStatus(id, { status, reason }, actor, options = {}) {
     throw ApiError.forbidden('You cannot modify an account at or above your own role');
   }
 
-  const before = user.toObject();
-  user.status = status;
-  await user.save();
+  const before = { ...user };
+  const updated = await users.update(user.id, { status });
 
   /**
    * Keep the identity provider in step with the local decision.
@@ -302,10 +285,10 @@ async function changeStatus(id, { status, reason }, actor, options = {}) {
    * renewing and makes the sign-out visible in the session list.
    */
   if (deactivating) {
-    const Session = require('../auth/session.model');
-    const revoked = await Session.revokeAllForUser(user._id, `account ${status.toLowerCase()}`);
+    const sessions = require('../auth/session.repository');
+    const revoked = await sessions.revokeAllForUser(user.id, `account ${status.toLowerCase()}`);
     logger.info(
-      { userId: String(user._id), sessionsRevoked: revoked.modifiedCount },
+      { userId: String(user.id), sessionsRevoked: revoked.modifiedCount },
       'Local sessions revoked on deactivation'
     );
   }
@@ -320,28 +303,24 @@ async function changeStatus(id, { status, reason }, actor, options = {}) {
 
   await auditService.record({
     action: AUDIT_ACTIONS.STATUS_CHANGE,
-    entity: { type: 'User', id: user._id, label: user.fullName },
-    changes: auditService.diff(before, user.toObject()),
+    entity: { type: 'User', id: updated.id, label: updated.fullName },
+    changes: auditService.diff(before, updated),
     metadata: { reason, identityProvider: identityResult },
     req,
   });
 
-  return user;
+  return updated;
 }
 
 /** The caller's own profile — what the portal loads on sign-in. */
 async function me(actor) {
-  const user = await User.findById(actor._id)
-    .populate('cooperative', 'name lga')
-    .populate('scope.communities', 'name lga')
-    .lean();
+  const user = await users.findById(actor.id);
+  if (!user) throw ApiError.notFound('Account not found');
 
   const { LGA_BY_CODE } = require('../../config/constants');
 
   return {
     ...user,
-    id: user._id,
-    fullName: [user.firstName, user.lastName].filter(Boolean).join(' '),
     /**
      * Resolved so the portal can render menus without a second call.
      *
@@ -375,22 +354,27 @@ async function me(actor) {
 /** Self-service profile update — contact details only. */
 async function updateMe(actor, payload, options = {}) {
   const { req } = options;
-  const user = await User.findById(actor._id);
-  const before = user.toObject();
+  const user = await users.findById(actor.id);
+  if (!user) throw ApiError.notFound('Account not found');
+  const before = { ...user };
 
+  // Contact details only. Role, scope and status are not self-service, and
+  // listing the allowed fields is what stops a payload reaching them.
+  const changes = {};
   for (const field of ['firstName', 'lastName', 'phone', 'designation']) {
-    if (payload[field] !== undefined) user[field] = payload[field];
+    if (payload[field] !== undefined) changes[field] = payload[field];
   }
-  await user.save();
+
+  const updated = await users.update(user.id, changes);
 
   await auditService.record({
     action: AUDIT_ACTIONS.UPDATE,
-    entity: { type: 'User', id: user._id, label: user.fullName },
-    changes: auditService.diff(before, user.toObject()),
+    entity: { type: 'User', id: updated.id, label: updated.fullName },
+    changes: auditService.diff(before, updated),
     req,
   });
 
-  return user;
+  return updated;
 }
 
 const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');

@@ -9,7 +9,7 @@ const firebase = require('../config/firebase');
 const { USER_STATUS, ROLES } = require('../config/constants');
 const ApiError = require('../utils/ApiError');
 const asyncHandler = require('../utils/asyncHandler');
-const User = require('../modules/users/user.model');
+const users = require('../modules/users/user.repository');
 const { assertPasswordChanged } = require('./requirePasswordChange');
 
 /**
@@ -203,22 +203,19 @@ async function resolveUser(claims, req) {
    * instead of leaving them valid until they expire.
    */
   if (config.auth.mode === 'local') {
-    const localUser = await User.findOne({ _id: authUid, isDeleted: { $ne: true } });
+    const localUser = await users.findById(authUid);
     if (!localUser) {
       throw new ApiError(401, 'This account no longer exists', { code: 'ACCOUNT_NOT_FOUND' });
     }
 
     if (claims.sid) {
-      const Session = require('../modules/auth/session.model');
-      const session = await Session.findById(claims.sid).select('revokedAt expiresAt user');
+      // The session is checked against this user, not just by id, so a
+      // token naming someone else's session is refused rather than
+      // accepted because the session happens to be live.
+      const sessions = require('../modules/auth/session.repository');
+      const session = await sessions.findUsable(claims.sid, localUser.id);
 
-      const sessionUsable =
-        session &&
-        !session.revokedAt &&
-        session.expiresAt > new Date() &&
-        String(session.user) === String(localUser._id);
-
-      if (!sessionUsable) {
+      if (!session) {
         throw new ApiError(401, 'Your session has ended, please sign in again', {
           code: 'SESSION_REVOKED',
         });
@@ -235,7 +232,7 @@ async function resolveUser(claims, req) {
   // An unverified address is not an identifier; it is a claim by the holder.
   const email = emailVerified ? rawEmail : undefined;
 
-  let user = await User.findOne({ authUid });
+  let user = await users.findByAuthUid(authUid);
 
   /**
    * An invited officer is pre-created by email, and the first sign-in binds
@@ -246,11 +243,7 @@ async function resolveUser(claims, req) {
    * STATE_ADMIN invitation and inherit state-wide access to the register.
    */
   if (!user && rawEmail) {
-    const invited = await User.findOne({
-      email: rawEmail,
-      authUid: { $in: [null, ''] },
-      isDeleted: { $ne: true },
-    });
+    const invited = await users.findUnclaimedInvitation(rawEmail);
 
     if (invited && !emailVerified) {
       logger.warn(
@@ -263,9 +256,10 @@ async function resolveUser(claims, req) {
     }
 
     if (invited) {
-      invited.authUid = authUid;
-      if (invited.status === USER_STATUS.PENDING) invited.status = USER_STATUS.ACTIVE;
-      user = invited;
+      user = await users.update(invited.id, {
+        authUid,
+        ...(invited.status === USER_STATUS.PENDING ? { status: USER_STATUS.ACTIVE } : {}),
+      });
       logger.info({ authUid, email: rawEmail }, 'Invitation claimed by a verified email');
     }
   }
@@ -281,7 +275,7 @@ async function resolveUser(claims, req) {
         code: 'EMAIL_NOT_VERIFIED',
       });
     }
-    user = new User({
+    user = await users.create({
       authUid,
       email,
       firstName: claims.given_name || claims.name || 'Pending',
@@ -314,13 +308,17 @@ function assertUsable(user) {
   }
 }
 
-/** Records activity, throttled to one write per 15 minutes per user. */
+/**
+ * Records activity, throttled to one write per 15 minutes per user.
+ *
+ * Throttled because this runs on every authenticated request: writing a
+ * timestamp each time would make every read a write, and the register's
+ * busiest hour is a sync.
+ */
 async function touch(user, req) {
-  const stale = !user.lastSeenAt || Date.now() - user.lastSeenAt.getTime() > 15 * 60 * 1000;
-  if (stale || user.isModified()) {
-    user.lastSeenAt = new Date();
-    user.lastDeviceId = req?.get?.('x-device-id') || user.lastDeviceId;
-    await user.save();
+  const lastSeen = user.lastSeenAt ? new Date(user.lastSeenAt).getTime() : 0;
+  if (Date.now() - lastSeen > 15 * 60 * 1000) {
+    await users.touch(user.id, { deviceId: req?.get?.('x-device-id') });
   }
 }
 

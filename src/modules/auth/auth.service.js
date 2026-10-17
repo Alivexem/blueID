@@ -3,8 +3,8 @@
 const crypto = require('node:crypto');
 const jwt = require('jsonwebtoken');
 
-const User = require('../users/user.model');
-const Session = require('./session.model');
+const users = require('../users/user.repository');
+const sessions = require('./session.repository');
 const password = require('../../utils/password');
 const emailService = require('../../services/email.service');
 const auditService = require('../../services/audit.service');
@@ -58,9 +58,9 @@ function issueAccessToken(user, sessionId) {
 async function createSession(user, { family, req } = {}) {
   const token = crypto.randomBytes(48).toString('base64url');
 
-  const session = await Session.create({
-    user: user._id,
-    tokenHash: Session.hashToken(token),
+  const session = await sessions.create({
+    user: user.id,
+    tokenHash: sessions.hashToken(token),
     family: family || crypto.randomUUID(),
     expiresAt: new Date(Date.now() + REFRESH_TOKEN_TTL_MS),
     ipAddress: req?.ip,
@@ -114,9 +114,7 @@ async function login({ email, password: plaintext }, options = {}) {
 
   const normalisedEmail = String(email || '').trim().toLowerCase();
 
-  const user = await User.findOne({ email: normalisedEmail, isDeleted: { $ne: true } }).select(
-    '+passwordHash +failedLoginAttempts +lockedUntil'
-  );
+  const user = await users.findForAuthentication(normalisedEmail);
 
   if (!user) {
     // Spend comparable time, so a missing account is not detectable by how
@@ -156,22 +154,18 @@ async function login({ email, password: plaintext }, options = {}) {
 
   // Transparently upgrade a hash made with weaker parameters.
   if (password.needsRehash(user.passwordHash)) {
-    user.passwordHash = await password.hash(plaintext);
+    await users.update(user.id, { passwordHash: await password.hash(plaintext) });
   }
 
-  user.failedLoginAttempts = 0;
-  user.lockedUntil = undefined;
-  user.lastLoginAt = new Date();
-  user.lastLoginIp = req?.ip;
-  await user.save();
+  await users.registerLoginSuccess(user.id, { ip: req?.ip });
 
   const { token: refreshToken, session } = await createSession(user, { req });
-  const accessToken = issueAccessToken(user, String(session._id));
+  const accessToken = issueAccessToken(user, String(session.id));
 
   await auditService.record({
     action: AUDIT_ACTIONS.LOGIN,
-    entity: { type: 'User', id: user._id, label: user.fullName },
-    metadata: { sessionId: String(session._id) },
+    entity: { type: 'User', id: user.id, label: user.fullName },
+    metadata: { sessionId: String(session.id) },
     req: { ...req, user },
   });
 
@@ -180,24 +174,33 @@ async function login({ email, password: plaintext }, options = {}) {
 
 /** Counts a failed attempt and locks the account once the threshold is hit. */
 async function recordFailure(user, reason, req) {
-  user.failedLoginAttempts = (user.failedLoginAttempts || 0) + 1;
+  /**
+   * One UPDATE, not read-modify-write.
+   *
+   * The previous version read the count, incremented it in JavaScript and
+   * saved, so two simultaneous attempts both read the same number and both
+   * wrote the same successor — an attacker running requests in parallel got
+   * roughly twice the attempts the lockout was meant to allow.
+   */
+  const state = await users.registerLoginFailure(user.id, {
+    threshold: MAX_FAILED_ATTEMPTS,
+    lockMinutes: Math.round(LOCKOUT_MS / 60000),
+  });
 
-  if (user.failedLoginAttempts >= MAX_FAILED_ATTEMPTS) {
-    user.lockedUntil = new Date(Date.now() + LOCKOUT_MS);
-    user.failedLoginAttempts = 0;
+  if (state?.lockedUntil) {
     logger.warn(
-      { userId: String(user._id), ip: req?.ip, until: user.lockedUntil },
+      { userId: String(user.id), ip: req?.ip, until: state.lockedUntil },
       'Account locked after repeated failed sign-ins'
     );
   }
 
-  await user.save();
-
+  // The real reason is written here, not returned: the caller gets one
+  // generic failure whatever went wrong, so the endpoint cannot be used to
+  // discover which addresses are registered.
   await auditService.recordFailure({
     action: AUDIT_ACTIONS.LOGIN,
-    entity: { type: 'User', id: user._id, label: user.fullName },
+    entity: { type: 'User', id: user.id, label: user.fullName },
     reason,
-    metadata: { attempts: user.failedLoginAttempts, locked: Boolean(user.lockedUntil) },
     req,
   });
 }
@@ -219,11 +222,11 @@ async function refresh({ refreshToken }, options = {}) {
 
   if (!refreshToken) throw invalid();
 
-  const session = await Session.findOne({ tokenHash: Session.hashToken(refreshToken) });
+  const session = await sessions.findByToken(refreshToken);
   if (!session) throw invalid();
 
   if (session.rotatedAt) {
-    await Session.revokeFamily(session.family, 'refresh token reused — possible theft');
+    await sessions.revokeFamily(session.family, 'refresh token reused — possible theft');
     logger.error(
       { userId: String(session.user), family: session.family, ip: req?.ip },
       'Refresh token reuse detected — the whole session family has been revoked'
@@ -239,12 +242,12 @@ async function refresh({ refreshToken }, options = {}) {
 
   if (session.revokedAt || session.expiresAt <= new Date()) throw invalid();
 
-  const user = await User.findOne({ _id: session.user, isDeleted: { $ne: true } });
+  const user = await users.findById(session.user);
   if (!user) throw invalid();
 
   // A suspension taken while the session was alive ends it here too.
   if (user.status !== USER_STATUS.ACTIVE) {
-    await Session.revokeAllForUser(user._id, `status ${user.status}`);
+    await sessions.revokeAllForUser(user.id, `status ${user.status}`);
     throw new ApiError(403, 'This account is no longer active', { code: 'ACCOUNT_INACTIVE' });
   }
 
@@ -253,12 +256,21 @@ async function refresh({ refreshToken }, options = {}) {
     req,
   });
 
-  session.rotatedAt = new Date();
-  session.rotatedTo = newSession.tokenHash;
-  session.lastUsedAt = new Date();
-  await session.save();
+  /**
+   * Retire the presented token, conditionally on it still being live.
+   *
+   * If this does not match, another refresh rotated it between the check
+   * above and here — which is the reuse case, not a double success. The
+   * new session is revoked so the race does not leave a stray credential.
+   */
+  const rotated = await sessions.rotate(session.id, { nextTokenHash: newSession.tokenHash });
+  if (!rotated) {
+    await sessions.revoke(newSession.id, 'lost a concurrent refresh');
+    await sessions.revokeFamily(session.family, 'concurrent refresh — possible theft');
+    throw invalid();
+  }
 
-  const accessToken = issueAccessToken(user, String(newSession._id));
+  const accessToken = issueAccessToken(user, String(newSession.id));
   return authPayload(user, accessToken, newToken, newSession);
 }
 
@@ -267,10 +279,7 @@ async function logout({ refreshToken }, actor, options = {}) {
   const { req } = options;
 
   if (refreshToken) {
-    await Session.updateOne(
-      { tokenHash: Session.hashToken(refreshToken), revokedAt: null },
-      { $set: { revokedAt: new Date(), revokedReason: 'signed out' } }
-    );
+    await sessions.revokeByToken(refreshToken, 'signed out');
   }
 
   if (actor) {
@@ -288,7 +297,7 @@ async function logout({ refreshToken }, actor, options = {}) {
 /** Signs the account out of every device. */
 async function logoutAll(actor, options = {}) {
   const { req } = options;
-  const result = await Session.revokeAllForUser(actor._id, 'signed out everywhere');
+  const result = await sessions.revokeAllForUser(actor.id, 'signed out everywhere');
 
   await auditService.record({
     action: AUDIT_ACTIONS.LOGIN,
@@ -302,7 +311,7 @@ async function logoutAll(actor, options = {}) {
 
 /** The caller's own active sessions, so they can spot one they don't know. */
 async function listSessions(actor) {
-  return Session.find({ user: actor._id, revokedAt: null, rotatedAt: null, expiresAt: { $gt: new Date() } })
+  return sessions.listLiveForUser(actor.id)
     .sort({ lastUsedAt: -1 })
     .select('ipAddress userAgent deviceCode createdAt lastUsedAt expiresAt')
     .lean();
@@ -319,7 +328,7 @@ async function listSessions(actor) {
 async function changePassword(actor, { currentPassword, newPassword }, options = {}) {
   const { req } = options;
 
-  const user = await User.findById(actor._id).select('+passwordHash');
+  const user = await users.findById(actor.id, { withCredentials: true });
   if (!user) throw ApiError.notFound('Account not found');
 
   const correct = await password.verify(user.passwordHash, currentPassword);
@@ -341,16 +350,17 @@ async function changePassword(actor, { currentPassword, newPassword }, options =
     });
   }
 
-  user.passwordHash = await password.hash(newPassword);
-  user.passwordChangedAt = new Date();
-  user.mustChangePassword = false;
-  await user.save();
+  await users.update(user.id, {
+    passwordHash: await password.hash(newPassword),
+    passwordChangedAt: new Date(),
+    mustChangePassword: false,
+  });
 
-  const revoked = await Session.revokeAllForUser(user._id, 'password changed');
+  const revoked = await sessions.revokeAllForUser(user.id, 'password changed');
 
   await auditService.record({
     action: AUDIT_ACTIONS.UPDATE,
-    entity: { type: 'User', id: user._id, label: user.fullName },
+    entity: { type: 'User', id: user.id, label: user.fullName },
     metadata: { event: 'password-changed', sessionsRevoked: revoked.modifiedCount },
     req,
   });
@@ -369,16 +379,17 @@ async function forgotPassword({ email }, options = {}) {
   const normalisedEmail = String(email || '').trim().toLowerCase();
   const generic = { ok: true, message: 'If that address has an account, a reset link has been sent' };
 
-  const user = await User.findOne({ email: normalisedEmail, isDeleted: { $ne: true } });
+  const user = await users.findByEmail(normalisedEmail);
   if (!user || user.status === USER_STATUS.DISABLED) {
     logger.info({ email: normalisedEmail }, 'Password reset requested for an unknown or disabled address');
     return generic;
   }
 
   const token = crypto.randomBytes(32).toString('base64url');
-  user.resetTokenHash = crypto.createHash('sha256').update(token).digest('hex');
-  user.resetTokenExpiresAt = new Date(Date.now() + RESET_TOKEN_TTL_MS);
-  await user.save();
+  await users.update(user.id, {
+    resetTokenHash: crypto.createHash('sha256').update(token).digest('hex'),
+    resetTokenExpiresAt: new Date(Date.now() + RESET_TOKEN_TTL_MS),
+  });
 
   const resetUrl = `${config.app.portalUrl}/reset-password?token=${token}`;
 
@@ -403,7 +414,7 @@ async function forgotPassword({ email }, options = {}) {
 
   await auditService.record({
     action: AUDIT_ACTIONS.UPDATE,
-    entity: { type: 'User', id: user._id, label: user.fullName },
+    entity: { type: 'User', id: user.id, label: user.fullName },
     metadata: { event: 'password-reset-requested' },
     req,
   });
@@ -420,13 +431,14 @@ async function resetPassword({ token, newPassword }, options = {}) {
 
   const tokenHash = crypto.createHash('sha256').update(String(token || '')).digest('hex');
 
-  const user = await User.findOne({
-    resetTokenHash: tokenHash,
-    resetTokenExpiresAt: { $gt: new Date() },
-    isDeleted: { $ne: true },
-  }).select('+passwordHash +resetTokenHash +resetTokenExpiresAt');
+  const user = await users.findByResetToken(tokenHash);
 
-  if (!user) {
+  // The expiry is checked here rather than in the lookup so a stale token
+  // and an unknown token give the same answer — a reset link that has
+  // expired should not confirm that it was ever real.
+  const expired = !user?.resetTokenExpiresAt || new Date(user.resetTokenExpiresAt) <= new Date();
+
+  if (!user || expired) {
     throw new ApiError(400, 'That reset link is invalid or has expired', {
       code: 'RESET_TOKEN_INVALID',
     });
@@ -434,24 +446,26 @@ async function resetPassword({ token, newPassword }, options = {}) {
 
   assertPasswordAcceptable(newPassword, user);
 
-  user.passwordHash = await password.hash(newPassword);
-  user.passwordChangedAt = new Date();
-  user.mustChangePassword = false;
-  user.resetTokenHash = undefined;
-  user.resetTokenExpiresAt = undefined;
-  user.failedLoginAttempts = 0;
-  user.lockedUntil = undefined;
+  await users.update(user.id, {
+    passwordHash: await password.hash(newPassword),
+    passwordChangedAt: new Date(),
+    mustChangePassword: false,
+    // Single use: clearing the token is what stops a link captured from an
+    // inbox being replayed.
+    resetTokenHash: null,
+    resetTokenExpiresAt: null,
+    failedLoginAttempts: 0,
+    lockedUntil: null,
+    // Completing a reset proves control of the address, which is what a
+    // pending invitation was waiting for.
+    ...(user.status === USER_STATUS.PENDING ? { status: USER_STATUS.ACTIVE } : {}),
+  });
 
-  // A reset is how someone recovers a compromised account, so everything else
-  // signed in as them must end.
-  if (user.status === USER_STATUS.PENDING) user.status = USER_STATUS.ACTIVE;
-  await user.save();
-
-  const revoked = await Session.revokeAllForUser(user._id, 'password reset');
+  const revoked = await sessions.revokeAllForUser(user.id, 'password reset');
 
   await auditService.record({
     action: AUDIT_ACTIONS.UPDATE,
-    entity: { type: 'User', id: user._id, label: user.fullName },
+    entity: { type: 'User', id: user.id, label: user.fullName },
     metadata: { event: 'password-reset-completed', sessionsRevoked: revoked.modifiedCount },
     req,
   });
@@ -479,22 +493,23 @@ function assertPasswordAcceptable(candidate, user) {
 async function adminResetPassword(userId, actor, options = {}) {
   const { req } = options;
 
-  const user = await User.findById(userId);
+  const user = await users.findById(userId);
   if (!user) throw ApiError.notFound('Account not found');
 
   const temporary = password.generateTemporary();
-  user.passwordHash = await password.hash(temporary);
-  user.passwordChangedAt = new Date();
-  user.mustChangePassword = true;
-  user.failedLoginAttempts = 0;
-  user.lockedUntil = undefined;
-  await user.save();
+  await users.update(user.id, {
+    passwordHash: await password.hash(temporary),
+    passwordChangedAt: new Date(),
+    mustChangePassword: true,
+    failedLoginAttempts: 0,
+    lockedUntil: null,
+  });
 
-  const revoked = await Session.revokeAllForUser(user._id, 'administrative password reset');
+  const revoked = await sessions.revokeAllForUser(user.id, 'administrative password reset');
 
   await auditService.record({
     action: AUDIT_ACTIONS.UPDATE,
-    entity: { type: 'User', id: user._id, label: user.fullName },
+    entity: { type: 'User', id: user.id, label: user.fullName },
     metadata: { event: 'admin-password-reset', sessionsRevoked: revoked.modifiedCount },
     req,
   });
