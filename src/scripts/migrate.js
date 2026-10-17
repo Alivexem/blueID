@@ -6,8 +6,8 @@
  *   npm run db:migrate            apply everything outstanding
  *   npm run db:migrate -- --status   list what has run and what has not
  *
- * Run by the `migrate` service in docker-compose before the API starts, and
- * by hand during a deploy. Safe to run twice: an applied migration is skipped.
+ * Run by provision.sh during setup, and before the service starts on a
+ * deploy. Safe to run twice: an applied migration is skipped.
  *
  * It refuses to proceed if a migration file has changed since it was applied,
  * because that means the database and the repository no longer agree about
