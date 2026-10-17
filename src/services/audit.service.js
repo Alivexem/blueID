@@ -1,6 +1,6 @@
 'use strict';
 
-const AuditLog = require('../modules/audit/audit.model');
+const auditRepository = require('../modules/audit/audit.repository');
 const logger = require('../config/logger');
 const { AUDIT_ACTIONS } = require('../config/constants');
 
@@ -61,7 +61,7 @@ function contextFrom(req) {
   return {
     actor: req.user
       ? {
-          user: req.user._id,
+          user: req.user.id || req.user._id,
           name: req.user.fullName,
           email: req.user.email,
           role: req.user.role,
@@ -81,35 +81,47 @@ function contextFrom(req) {
  * Records one audit entry. Fire-and-forget by default — callers should not
  * await it on the hot path unless ordering matters.
  */
-async function record({ action, entity, changes, metadata, lga, outcome, failureReason, req }) {
+async function record({ action, entity, changes, metadata, lga, outcome, failureReason, req, client }) {
   try {
     const { actor, context } = contextFrom(req);
-    await AuditLog.create({
-      action,
-      actor,
-      entity,
-      changes: changes || [],
-      metadata,
-      lga,
-      outcome: outcome || 'SUCCESS',
-      failureReason,
-      context,
-    });
+    await auditRepository.record(
+      {
+        action,
+        actor,
+        entity,
+        changes: changes || [],
+        metadata,
+        lga,
+        succeeded: (outcome || 'SUCCESS') === 'SUCCESS',
+        failureReason,
+        context,
+      },
+      // Passing a transaction client makes the entry part of the change it
+      // describes, so a rolled-back operation leaves no record of having
+      // happened. Callers on the hot path omit it and stay fire-and-forget.
+      { client }
+    );
   } catch (err) {
     logger.error({ err, action, entity }, 'Failed to write audit log entry');
   }
 }
 
-/** Convenience wrapper for create/update/delete of a Mongoose document. */
-async function recordChange({ action, doc, before, req, metadata }) {
-  const entityType = doc?.constructor?.modelName || 'Unknown';
+/**
+ * Convenience wrapper for a create, update or delete.
+ *
+ * `entityType` used to come from the Mongoose model name, which no longer
+ * exists; it is now passed in. Callers that forget get 'Unknown' rather than
+ * a crash, because a mislabelled audit entry is better than a failed write
+ * on the path it is auditing.
+ */
+async function recordChange({ action, doc, before, req, metadata, entityType, client }) {
   const after = typeof doc?.toObject === 'function' ? doc.toObject() : doc;
 
   return record({
     action,
     entity: {
-      type: entityType,
-      id: doc?._id,
+      type: entityType || 'Unknown',
+      id: doc?.id || doc?._id,
       blueId: after?.blueId,
       label: after?.fullName || after?.name || after?.code,
     },
@@ -117,6 +129,7 @@ async function recordChange({ action, doc, before, req, metadata }) {
     metadata,
     lga: after?.lga,
     req,
+    client,
   });
 }
 
@@ -133,12 +146,27 @@ async function recordFailure({ action, entity, reason, req, metadata }) {
 }
 
 /** Reads the history of one record, newest first. */
-async function historyFor(entityType, entityId, { limit = 50 } = {}) {
-  return AuditLog.find({ 'entity.type': entityType, 'entity.id': entityId })
-    .sort({ createdAt: -1 })
-    .limit(limit)
-    .populate('actor.user', 'firstName lastName email role')
-    .lean();
+function historyFor(entityType, entityId, { limit = 50 } = {}) {
+  return auditRepository.forEntity(entityType, entityId, { limit });
 }
 
-module.exports = { record, recordChange, recordFailure, historyFor, diff, contextFrom };
+/** Searches the trail. Scope is applied in SQL, not after loading. */
+function search(query, { scope } = {}) {
+  return auditRepository.search(query, { scope });
+}
+
+/** Enumerator activity for the dashboard panel. */
+function actorActivity(options) {
+  return auditRepository.actorActivity(options);
+}
+
+module.exports = {
+  record,
+  recordChange,
+  recordFailure,
+  historyFor,
+  search,
+  actorActivity,
+  diff,
+  contextFrom,
+};

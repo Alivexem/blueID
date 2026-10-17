@@ -130,6 +130,76 @@ async function reclaimExpired({ client } = {}) {
   return rows.map((r) => sql.mapRow(r));
 }
 
+/**
+ * Claims one named side effect on a job, once.
+ *
+ * A job that crashes after sending an email and before committing will be
+ * retried, and the retry must not send the email again. The claim is a
+ * conditional array append: exactly one attempt can add the name, so exactly
+ * one attempt performs the effect.
+ *
+ * The marker is written BEFORE the effect deliberately. A missed
+ * notification is recoverable by looking at the record; a second official
+ * email to a fisherman is not retractable.
+ */
+async function claimSideEffect(jobId, name, { client } = {}) {
+  const { rows } = await database.query(
+    `UPDATE ${TABLE}
+        SET side_effects = side_effects || to_jsonb($2::text)
+      WHERE id = $1 AND NOT (side_effects @> to_jsonb($2::text))
+      RETURNING id`,
+    [jobId, name],
+    client
+  );
+  return rows.length > 0;
+}
+
+/** Requeues a dead job once the underlying problem has been fixed. */
+async function retryDead(jobId, { client } = {}) {
+  const { rows } = await database.query(
+    `UPDATE ${TABLE}
+        SET status = 'PENDING', attempts = 0, run_at = now(),
+            last_error = NULL, locked_by = NULL, locked_until = NULL
+      WHERE id = $1 AND status = 'DEAD' RETURNING *`,
+    [jobId],
+    client
+  );
+  return rows.length ? shape(rows[0]) : null;
+}
+
+/** Removes completed jobs past their retention. Keeps the table small. */
+async function sweepCompleted({ olderThanDays = 7 } = {}, { client } = {}) {
+  const { rowCount } = await database.query(
+    `DELETE FROM ${TABLE}
+      WHERE status = 'COMPLETED' AND completed_at < now() - ($1 || ' days')::interval`,
+    [String(olderThanDays)],
+    client
+  );
+  return rowCount;
+}
+
+/** How many jobs are due right now. */
+async function countDue({ client } = {}) {
+  return Number(
+    await sql.scalar(
+      `SELECT count(*) FROM ${TABLE} WHERE status = 'PENDING' AND run_at <= now()`,
+      [],
+      client
+    )
+  );
+}
+
+async function oldestPending({ client } = {}) {
+  const { rows } = await database.query(
+    `SELECT id, type, run_at FROM ${TABLE}
+      WHERE status = 'PENDING' AND run_at <= now()
+      ORDER BY run_at ASC LIMIT 1`,
+    [],
+    client
+  );
+  return rows.length ? sql.mapRow(rows[0]) : null;
+}
+
 async function stats({ client } = {}) {
   const { rows } = await database.query(
     `SELECT status, count(*)::int AS count,
@@ -158,4 +228,5 @@ async function hardDelete(filter = {}, { client } = {}) {
 module.exports = {
   TABLE, COLUMNS, shape,
   enqueue, claimNext, complete, fail, reclaimExpired, stats, findById, hardDelete,
+  claimSideEffect, retryDead, sweepCompleted, countDue, oldestPending,
 };

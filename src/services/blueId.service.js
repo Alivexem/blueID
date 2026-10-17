@@ -3,7 +3,7 @@
 const crypto = require('node:crypto');
 const config = require('../config');
 const { LGA_BY_CODE } = require('../config/constants');
-const Counter = require('../modules/fishermen/counter.model');
+const Counter = require('../modules/fishermen/counter.repository');
 const ApiError = require('../utils/ApiError');
 
 /**

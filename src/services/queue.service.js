@@ -1,6 +1,6 @@
 'use strict';
 
-const OutboxJob = require('../modules/outbox/outbox.model');
+const outbox = require('../modules/outbox/outbox.repository');
 const logger = require('../config/logger');
 const config = require('../config');
 
@@ -60,23 +60,20 @@ async function enqueue(type, payload = {}, options = {}) {
     priority,
     maxAttempts,
     requestId: req?.id,
-    actor: req?.user?._id,
+    actor: req?.user?.id || req?.user?._id,
     lga: payload.lga,
   };
 
-  try {
-    const [job] = await OutboxJob.create([doc], session ? { session } : {});
-    logger.debug({ type, jobId: job._id, dedupeKey }, 'Job enqueued');
-    return job;
-  } catch (err) {
-    // A duplicate dedupeKey means the job is already scheduled or done. That
-    // is the point of the key, so it is a success, not a failure.
-    if (err.code === 11000) {
-      logger.debug({ type, dedupeKey }, 'Job already enqueued — skipping duplicate');
-      return null;
-    }
-    throw err;
+  // A duplicate dedupeKey means the job is already scheduled. That is the
+  // point of the key, so the repository returns null rather than raising —
+  // it is a success, not a failure.
+  const job = await outbox.enqueue(doc, { client: session });
+  if (!job) {
+    logger.debug({ type, dedupeKey }, 'Job already enqueued — skipping duplicate');
+    return null;
   }
+  logger.debug({ type, jobId: job.id, dedupeKey }, 'Job enqueued');
+  return job;
 }
 
 /**
@@ -106,16 +103,13 @@ function enqueueSafe(type, payload, options) {
  * duplicate official email to a fisherman is not retractable.
  */
 async function once(job, name, fn) {
-  if (!job?._id) return fn();
+  const jobId = job?.id || job?._id;
+  if (!jobId) return fn();
 
-  const claimed = await OutboxJob.findOneAndUpdate(
-    { _id: job._id, sideEffects: { $ne: name } },
-    { $addToSet: { sideEffects: name } },
-    { new: true }
-  );
+  const claimed = await outbox.claimSideEffect(jobId, name);
 
   if (!claimed) {
-    logger.info({ jobId: job._id, name }, 'Side effect already performed — skipping on retry');
+    logger.info({ jobId, name }, 'Side effect already performed — skipping on retry');
     return { skipped: true, reason: 'already performed' };
   }
 
@@ -124,13 +118,7 @@ async function once(job, name, fn) {
 
 /** Marks a claimed job finished. */
 async function complete(job) {
-  await OutboxJob.updateOne(
-    { _id: job._id },
-    {
-      $set: { status: 'COMPLETED', completedAt: new Date(), lastError: undefined },
-      $unset: { lockedBy: '', lockedUntil: '' },
-    }
-  );
+  await outbox.complete(job.id || job._id);
 }
 
 /**
@@ -139,64 +127,52 @@ async function complete(job) {
  */
 async function fail(job, error) {
   const message = error?.message || String(error);
-  const exhausted = job.attempts >= job.maxAttempts;
+  const jobId = job.id || job._id;
 
-  await OutboxJob.updateOne(
-    { _id: job._id },
-    {
-      $set: {
-        status: exhausted ? 'DEAD' : 'PENDING',
-        lastError: message.slice(0, 1000),
-        ...(exhausted ? {} : { runAt: nextRunAt(job.attempts) }),
-      },
-      $unset: { lockedBy: '', lockedUntil: '' },
-    }
-  );
+  // The repository decides DEAD vs PENDING from attempts against
+  // maxAttempts, so the rule lives in one place rather than being
+  // recomputed here and there.
+  const updated = await outbox.fail(jobId, {
+    error: message,
+    backoffSeconds: Math.round((nextRunAt(job.attempts) - Date.now()) / 1000),
+  });
 
-  if (exhausted) {
+  if (updated?.status === 'DEAD') {
     logger.error(
-      { jobId: job._id, type: job.type, attempts: job.attempts, error: message },
+      { jobId, type: job.type, attempts: job.attempts, error: message },
       'Job moved to dead-letter after exhausting retries'
     );
   } else {
-    logger.warn({ jobId: job._id, type: job.type, attempt: job.attempts }, 'Job failed — will retry');
+    logger.warn({ jobId, type: job.type, attempt: job.attempts }, 'Job failed — will retry');
   }
 }
 
 /** Queue depth and health, for the ops dashboard and /health. */
 async function stats() {
-  const rows = await OutboxJob.aggregate([
-    { $group: { _id: '$status', count: { $sum: 1 } } },
+  const [rows, due, oldest] = await Promise.all([
+    outbox.stats(),
+    outbox.countDue(),
+    outbox.oldestPending(),
   ]);
-  const byStatus = Object.fromEntries(rows.map((r) => [r._id, r.count]));
 
-  const oldest = await OutboxJob.findOne({ status: 'PENDING', runAt: { $lte: new Date() } })
-    .sort({ runAt: 1 })
-    .select('runAt type')
-    .lean();
+  const byStatus = Object.fromEntries(rows.map((r) => [r.status, r.count]));
 
   return {
     byStatus,
-    due: await OutboxJob.countPending(),
+    due,
     oldestPendingAgeMs: oldest ? Date.now() - new Date(oldest.runAt).getTime() : 0,
     oldestPendingType: oldest?.type || null,
   };
 }
 
 /** Requeues a dead job after the underlying problem has been fixed. */
-async function retryDead(jobId) {
-  return OutboxJob.findOneAndUpdate(
-    { _id: jobId, status: 'DEAD' },
-    { $set: { status: 'PENDING', attempts: 0, runAt: new Date(), lastError: undefined } },
-    { new: true }
-  );
+function retryDead(jobId) {
+  return outbox.retryDead(jobId);
 }
 
 /** Removes completed jobs older than `olderThanDays`. */
-async function sweep(olderThanDays = 7) {
-  const cutoff = new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000);
-  const result = await OutboxJob.deleteMany({ status: 'COMPLETED', completedAt: { $lt: cutoff } });
-  return result.deletedCount;
+function sweep(olderThanDays = 7) {
+  return outbox.sweepCompleted({ olderThanDays });
 }
 
 module.exports = {

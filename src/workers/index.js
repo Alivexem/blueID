@@ -2,7 +2,7 @@
 
 const crypto = require('node:crypto');
 
-const OutboxJob = require('../modules/outbox/outbox.model');
+const outbox = require('../modules/outbox/outbox.repository');
 const queue = require('../services/queue.service');
 const cache = require('../services/cache.service');
 const { HANDLERS } = require('./handlers');
@@ -16,7 +16,7 @@ const logger = require('../config/logger');
  * single-instance government deployment: one process to operate, one set of
  * credentials, no separate deploy. `WORKER_ENABLED=false` turns it off so the
  * same image can be run as a dedicated worker fleet later without a code
- * change — claiming is atomic in MongoDB, so any number of processes may run
+ * change — claiming uses FOR UPDATE SKIP LOCKED, so any number of processes may run
  * the loop concurrently and safely.
  *
  * Concurrency is bounded (`WORKER_CONCURRENCY`) so a burst of registrations
@@ -68,7 +68,7 @@ async function tick() {
 
   try {
     while (running && active < config.worker.concurrency) {
-      const job = await OutboxJob.claimOne(WORKER_ID, { lockSeconds: LOCK_SECONDS });
+      const job = await outbox.claimNext({ workerId: WORKER_ID, leaseSeconds: LOCK_SECONDS });
       if (!job) break;
 
       active += 1;
