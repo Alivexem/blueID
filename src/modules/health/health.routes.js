@@ -2,7 +2,7 @@
 
 const express = require('express');
 const database = require('../../config/database');
-const redis = require('../../config/redis');
+const cache = require('../../config/cache');
 const cloudinary = require('../../config/cloudinary');
 const mediaService = require('../../services/media.service');
 const config = require('../../config');
@@ -65,20 +65,23 @@ async function collectChecks() {
     checks.mongodb = { status: 'error', error: err.message };
   }
 
+  /**
+   * The cache lives in this process. That is the design, not a degradation —
+   * there is no external cache to be unreachable. What is worth reporting is
+   * the consequence: rate limits and the sync lock are scoped to this
+   * instance, so the deployment must run exactly one.
+   */
   try {
-    const latencyMs = await redis.ping();
-    // In production the in-memory fallback is a failure, not a degradation:
-    // rate limits stop being shared and the sync lock stops being distributed.
-    const onFallback = redis.isMemoryFallback();
-    checks.redis = {
-      status: onFallback ? (config.isProduction ? 'error' : 'degraded') : 'ok',
+    const latencyMs = await cache.ping();
+    checks.cache = {
+      status: 'ok',
+      kind: 'in-process',
       latencyMs,
-      ...(onFallback
-        ? { note: 'in-memory fallback — rate limits are per-process and not shared' }
-        : {}),
+      entries: cache.size(),
+      note: 'per-instance; rate limits and the sync lock are not shared across processes',
     };
   } catch (err) {
-    checks.redis = { status: 'error', error: err.message };
+    checks.cache = { status: 'error', kind: 'in-process', error: err.message };
   }
 
   /**
@@ -158,7 +161,7 @@ const readiness = asyncHandler(async (req, res) => {
   const healthy =
     checks.mongodb.status === 'ok' &&
     checks.indexes?.status !== 'error' &&
-    checks.redis.status !== 'error' &&
+    checks.cache?.status !== 'error' &&
     // A register that cannot store a photograph cannot complete a
     // registration, so this instance should not be taking traffic.
     checks.media?.status !== 'error';

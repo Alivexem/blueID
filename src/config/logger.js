@@ -30,12 +30,10 @@ const redact = {
     '*.photo.url',
     '*.signedUrl',
     // Explicit paths: the `*.token` wildcard matches only one level deep, so
-    // nested credentials like config.redis.token would otherwise pass through.
+    // nested credentials would otherwise pass through.
     'config.auth.secret',
     'config.auth.serviceApiKey',
     'config.security.fieldEncryptionKey',
-    'config.redis.token',
-    'config.redis.url',
     'config.brevo.apiKey',
     'config.cloudinary.apiSecret',
     'config.firebase.privateKey',

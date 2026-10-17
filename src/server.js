@@ -23,6 +23,11 @@ let server;
 let shuttingDown = false;
 
 async function start() {
+  // Refuses to boot a second instance while the cache, rate limiter and sync
+  // lock are per-process. Checked first so the failure is a clear startup
+  // error rather than a duplicated allocation months later.
+  require('./config/cache').assertSingleInstance();
+
   await database.connect();
 
   server = http.createServer(app);
@@ -47,7 +52,7 @@ async function start() {
       env: config.env,
       apiPrefix: config.app.apiPrefix,
       authMode: config.auth.mode,
-      cache: config.redis.enabled ? 'upstash' : 'in-memory',
+      cache: 'in-process',
       media: config.cloudinary.enabled ? 'cloudinary' : 'disabled',
       email: config.brevo.enabled ? (config.brevo.dryRun ? 'brevo (dry run)' : 'brevo') : 'disabled',
     },

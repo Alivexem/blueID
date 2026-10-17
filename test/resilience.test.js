@@ -42,7 +42,7 @@ const unique = (p) => `${p}-${crypto.randomBytes(4).toString('hex')}`;
 // ---------------------------------------------------------------------------
 
 test('a cache read failure degrades to the producer, never to an error', async () => {
-  const { client } = require('../src/config/redis');
+  const { client } = require('../src/config/cache');
   const originalGet = client.get;
 
   let producerCalls = 0;
@@ -66,7 +66,7 @@ test('a cache read failure degrades to the producer, never to an error', async (
 });
 
 test('an unreadable namespace version disables caching rather than guessing', async () => {
-  const { client } = require('../src/config/redis');
+  const { client } = require('../src/config/cache');
   const originalGet = client.get;
 
   client.get = async () => {
@@ -99,7 +99,7 @@ test('the cache recovers once Redis returns', async () => {
 });
 
 test('a rate-limit counter falls back to a per-process budget, not to no limit', async () => {
-  const { client } = require('../src/config/redis');
+  const { client } = require('../src/config/cache');
   const { createLimiter } = require('../src/middleware/rateLimiter');
   const originalSet = client.set;
   const originalIncr = client.incr;

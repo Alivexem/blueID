@@ -1,15 +1,33 @@
 'use strict';
 
-const { Redis } = require('@upstash/redis');
 const config = require('./index');
 const logger = require('./logger');
 
 /**
- * Upstash Redis over its REST API.
+ * In-process cache.
  *
- * Caching is an optimisation, never a dependency: when Upstash is not
- * configured (fresh clone, local dev) we fall back to a bounded in-process map
- * so the API still runs. Nothing in the domain layer should care which is live.
+ * This deployment runs a single application instance on a server inside
+ * Nigeria, so there is no external cache. Upstash was removed deliberately:
+ * it held personal data — `verify:line:<BlueID>` cached a fisherman's name,
+ * community and status — on infrastructure outside the country, which NITDA's
+ * National Cloud Policy does not permit for identity data.
+ *
+ * WHAT THIS COSTS, AND WHY IT IS ACCEPTABLE HERE
+ *
+ * A per-process store is not shared, so with more than one instance:
+ *
+ *   - each instance caches separately (harmless, just less effective)
+ *   - rate limits count per instance, so N instances allow N times the limit
+ *   - `acquireLock` no longer excludes other instances
+ *
+ * The last is the dangerous one: the sync pipeline uses a lock to stop one
+ * device's batch being processed twice concurrently, and processing a benefit
+ * allocation twice is exactly the duplication this register exists to prevent.
+ *
+ * So: ONE INSTANCE ONLY. `assertSingleInstance()` runs at boot and refuses to
+ * start a second in production. To scale out, move the lock to a PostgreSQL
+ * advisory lock — shared, transactional, and no second datastore. The
+ * Postgres migration makes that a few lines; see OPERATIONS.md.
  */
 
 const MEMORY_LIMIT = 1000;
@@ -113,27 +131,13 @@ class MemoryStore {
     this.map.clear();
     return 'OK';
   }
+
+  size() {
+    return this.map.size;
+  }
 }
 
-let client;
-let usingMemory = false;
-
-if (config.redis.enabled) {
-  client = new Redis({
-    url: config.redis.url,
-    token: config.redis.token,
-    // The REST client retries idempotent reads; keep it short so a slow cache
-    // never dominates a request.
-    retry: { retries: 2, backoff: (attempt) => Math.min(100 * 2 ** attempt, 500) },
-  });
-  logger.info('Redis: Upstash REST client initialised');
-} else {
-  client = new MemoryStore();
-  usingMemory = true;
-  const message = 'Redis not configured — using in-memory cache fallback';
-  if (config.isProduction) logger.error(message);
-  else logger.warn(message);
-}
+const client = new MemoryStore();
 
 async function ping() {
   const started = Date.now();
@@ -141,9 +145,31 @@ async function ping() {
   return Date.now() - started;
 }
 
+/**
+ * Refuses to run more than one instance in production.
+ *
+ * The cache, the rate limiter and the sync lock are all per-process. A second
+ * instance does not degrade them gracefully — it breaks the lock's only
+ * guarantee. Catching that at boot is far better than discovering it as a
+ * duplicated benefit allocation months later.
+ */
+function assertSingleInstance() {
+  const instances = Number(process.env.WEB_CONCURRENCY || process.env.INSTANCES || 1);
+
+  if (config.isProduction && instances > 1) {
+    throw new Error(
+      `This build keeps its cache, rate limits and sync lock in process, so it must run as a single instance (found ${instances}). ` +
+        'To scale out, move the sync lock to a PostgreSQL advisory lock first — see OPERATIONS.md.'
+    );
+  }
+}
+
 module.exports = {
   client,
-  isMemoryFallback: () => usingMemory,
-  isEnabled: () => config.redis.enabled,
   ping,
+  assertSingleInstance,
+  size: () => client.size(),
+  /** Retained so callers that branched on these keep working. */
+  isMemoryFallback: () => true,
+  isEnabled: () => true,
 };

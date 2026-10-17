@@ -31,7 +31,7 @@ const {
  * so an LGA administrator's dashboard is cached separately from the state view.
  */
 
-const TTL = () => config.redis.dashboardTtl;
+const TTL = () => config.cache.dashboardTtl;
 
 /**
  * Cache key for an authorization-dependent response.
