@@ -1,7 +1,7 @@
 'use strict';
 
 const crypto = require('node:crypto');
-const { client } = require('../config/redis');
+const { client } = require('../config/cache');
 const config = require('../config');
 const logger = require('../config/logger');
 
@@ -25,7 +25,7 @@ const logger = require('../config/logger');
  *      stale keyspace.
  */
 
-const key = (...parts) => [config.redis.prefix, ...parts.filter((p) => p != null)].join(':');
+const key = (...parts) => [config.cache.prefix, ...parts.filter((p) => p != null)].join(':');
 
 /**
  * Version keys outlive every cached entry by a wide margin (30 days versus a
@@ -47,7 +47,7 @@ async function get(cacheKey) {
   }
 }
 
-async function set(cacheKey, value, ttlSeconds = config.redis.ttl) {
+async function set(cacheKey, value, ttlSeconds = config.cache.ttl) {
   try {
     await client.set(key(cacheKey), value, { ex: ttlSeconds });
     return true;

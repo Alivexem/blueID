@@ -173,7 +173,7 @@ test('counters are created with their expiry in one operation', async () => {
    * second call is lost — and an immortal counter means a permanent lockout.
    * `SET ... NX EX` establishes the lifetime atomically.
    */
-  const { client } = require('../src/config/redis');
+  const { client } = require('../src/config/cache');
   const key = `test:ttl:${Date.now()}`;
 
   const first = await client.set(key, 0, { ex: 60, nx: true });
@@ -189,7 +189,7 @@ test('counters are created with their expiry in one operation', async () => {
 });
 
 test('the memory fallback honours NX, so the sync lock actually locks', async () => {
-  const { client } = require('../src/config/redis');
+  const { client } = require('../src/config/cache');
   const key = `test:lock:${Date.now()}`;
 
   assert.equal(await client.set(key, 'first', { ex: 30, nx: true }), 'OK');

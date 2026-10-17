@@ -178,7 +178,7 @@ test('production refuses unsafe configuration', () => {
     ['AUTH_MODE', 'disabled'],
     ['AUTH_AUTO_PROVISION', true],
     ['AUTH_REQUIRE_VERIFIED_EMAIL', false],
-    ['UPSTASH_REDIS_REST_TOKEN', ''],
+    ['MEDIA_URL_SECRET', ''],
     ['FIELD_ENCRYPTION_KEY', ''],
     ['QR_SIGNING_SECRET', ''],
   ];

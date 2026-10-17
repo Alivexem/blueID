@@ -76,8 +76,6 @@ const schema = z
     MONGODB_MAX_POOL_SIZE: int(20),
     MONGODB_MIN_POOL_SIZE: int(2),
 
-    UPSTASH_REDIS_REST_URL: z.string().default(''),
-    UPSTASH_REDIS_REST_TOKEN: z.string().default(''),
     CACHE_PREFIX: z.string().default('blueid'),
     CACHE_TTL_SECONDS: int(300),
     DASHBOARD_CACHE_TTL_SECONDS: int(120),
@@ -330,21 +328,6 @@ const schema = z
           'The production MongoDB connection must use TLS (mongodb+srv:// or tls=true)',
       });
     }
-    if (isProd && !env.UPSTASH_REDIS_REST_URL) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['UPSTASH_REDIS_REST_URL'],
-        message: 'Redis is required in production for distributed rate limiting',
-      });
-    }
-    if (isProd && !env.UPSTASH_REDIS_REST_TOKEN) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['UPSTASH_REDIS_REST_TOKEN'],
-        message:
-          'UPSTASH_REDIS_REST_TOKEN is required in production — without it the API silently falls back to a per-process cache',
-      });
-    }
     if (isProd && env.CORS_ORIGINS.includes('*')) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -417,10 +400,8 @@ const config = {
     },
   },
 
-  redis: {
-    url: env.UPSTASH_REDIS_REST_URL,
-    token: env.UPSTASH_REDIS_REST_TOKEN,
-    enabled: Boolean(env.UPSTASH_REDIS_REST_URL && env.UPSTASH_REDIS_REST_TOKEN),
+  cache: {
+    /** In-process only — there is no external cache. See config/cache.js. */
     prefix: env.CACHE_PREFIX,
     ttl: env.CACHE_TTL_SECONDS,
     dashboardTtl: env.DASHBOARD_CACHE_TTL_SECONDS,

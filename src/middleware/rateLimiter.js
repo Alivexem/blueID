@@ -1,19 +1,19 @@
 'use strict';
 
 const rateLimit = require('express-rate-limit');
-const { client, isEnabled } = require('../config/redis');
+const { client, isEnabled } = require('../config/cache');
 const config = require('../config');
 const logger = require('../config/logger');
 const ApiError = require('../utils/ApiError');
 
 /**
- * Distributed rate limiting.
+ * Rate limiting.
  *
- * Two problems with the obvious implementation, both fixed here:
- *
- * 1. PER-PROCESS COUNTERS. The default memory store means every API instance
- *    enforces its own budget, so N instances multiply the real limit by N.
- *    Counters now live in Redis, shared across the fleet.
+ * 1. PER-PROCESS COUNTERS. Counters live in this process, so the budget is
+ *    per instance: N instances would allow N times the limit. That is why
+ *    the app refuses to boot more than one instance in production — see
+ *    config/cache.js. Moving these counters to PostgreSQL is the step that
+ *    would make scaling out safe.
  *
  * 2. KEYED BY IP ONLY. The limiter runs before authentication, so `req.user`
  *    was always undefined and every officer in an LGA office behind one NAT
@@ -23,12 +23,12 @@ const ApiError = require('../utils/ApiError');
  *    and per-IP otherwise. The id comes from a verified signature, so it
  *    cannot be spoofed to escape a limit.
  *
- * Redis failures fail OPEN: a cache outage must not lock every field officer
+ * Counter failures fail OPEN: a cache fault must not lock every field officer
  * out of the register.
  */
 
 /**
- * Fixed-window counter in Redis, evaluated with INCR + EXPIRE.
+ * Fixed-window counter, evaluated with INCR + EXPIRE.
  *
  * A sliding window would be more precise, but this is one round trip, is
  * atomic without a Lua script, and the imprecision at a window boundary is
@@ -49,18 +49,17 @@ const ApiError = require('../utils/ApiError');
  * subsequent INCR can then fail harmlessly — the worst case is an undercount
  * for one request, never an immortal key.
  */
-async function incrementWithTtl(redisKey, ttlSeconds) {
-  await client.set(redisKey, 0, { ex: ttlSeconds, nx: true });
-  return client.incr(redisKey);
+async function incrementWithTtl(counterKey, ttlSeconds) {
+  await client.set(counterKey, 0, { ex: ttlSeconds, nx: true });
+  return client.incr(counterKey);
 }
 
 /**
- * Per-process fallback used only while Redis is unreachable.
+ * Fallback used only if the counter store itself throws.
  *
- * Failing fully open means a Redis outage removes all abuse protection from
- * the API at once. This keeps a local budget so protection degrades — each
- * instance enforces its own limit — instead of disappearing. Entries are
- * bounded and swept, so it cannot grow without limit during a long outage.
+ * Failing fully open would remove all abuse protection from the API at once.
+ * This keeps a local budget so protection degrades rather than disappearing.
+ * Entries are bounded and swept, so it cannot grow without limit.
  */
 const LOCAL_FALLBACK_LIMIT = 10_000;
 const localCounters = new Map();
@@ -89,19 +88,19 @@ setInterval(() => {
   }
 }, 60_000).unref();
 
-function redisStore(prefix) {
+function counterStore(prefix) {
   return {
     async increment(key, windowMs) {
       const bucket = Math.floor(Date.now() / windowMs);
-      const redisKey = `${config.redis.prefix}:rl:${prefix}:${key}:${bucket}`;
+      const counterKey = `${config.cache.prefix}:rl:${prefix}:${key}:${bucket}`;
       const ttlSeconds = Math.ceil(windowMs / 1000) + 1;
 
       try {
-        const hits = await incrementWithTtl(redisKey, ttlSeconds);
+        const hits = await incrementWithTtl(counterKey, ttlSeconds);
         return { hits, resetTime: new Date((bucket + 1) * windowMs), degraded: false };
       } catch (err) {
         // Degrade to a per-instance budget rather than to no limit at all.
-        const hits = localIncrement(redisKey, windowMs);
+        const hits = localIncrement(counterKey, windowMs);
         logger.warn({ err, prefix }, 'Rate limiter falling back to per-process counters');
         return { hits, resetTime: new Date((bucket + 1) * windowMs), degraded: true };
       }
@@ -136,9 +135,8 @@ function normaliseIp(ip = '') {
 }
 
 /**
- * Builds a limiter. Uses Redis when configured; otherwise falls back to
- * express-rate-limit's in-process store, which is correct for a single
- * instance and is all a development machine needs.
+ * Builds a limiter backed by the process cache. Correct for a single
+ * instance, which is what this deployment runs.
  */
 function createLimiter({ name, windowMs, max, keyBy = identify, skip }) {
   if (!isEnabled()) {
@@ -156,7 +154,7 @@ function createLimiter({ name, windowMs, max, keyBy = identify, skip }) {
     });
   }
 
-  const store = redisStore(name);
+  const store = counterStore(name);
 
   return async function limiter(req, res, next) {
     if (skip?.(req)) return next();
@@ -252,12 +250,12 @@ const writeLimiter = createLimiter({
  * the threshold is crossed — which is what turns token replay and invitation
  * probing into something detectable and bounded.
  *
- * Failures are counted in Redis so the threshold holds across instances, and
+ * Failures are counted in the process cache, and
  * the counter is cleared on a successful authentication.
  */
 const AUTH_FAILURE_WINDOW_SECONDS = 15 * 60;
 
-const failureKey = (req) => `${config.redis.prefix}:authfail:${normaliseIp(req.ip)}`;
+const failureKey = (req) => `${config.cache.prefix}:authfail:${normaliseIp(req.ip)}`;
 
 /** Called from the error handler whenever a 401/403 is produced. */
 async function recordAuthFailure(req) {
