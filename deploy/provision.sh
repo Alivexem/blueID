@@ -52,6 +52,20 @@ apt-get install -y -qq \
 # ---------------------------------------------------------------------------
 log "PostgreSQL ${PG_VERSION} with PostGIS"
 # ---------------------------------------------------------------------------
+# The PostgreSQL Global Development Group archive. Ubuntu 24.04 ships 16 but
+# 22.04 ships 14, so pinning a version without this makes the script work on
+# one release and fail on the other. PGDG also keeps security updates coming
+# for the pinned major after the Ubuntu release stops tracking it.
+if [[ ! -f /etc/apt/sources.list.d/pgdg.list ]]; then
+  install -d /etc/apt/keyrings
+  curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+    | gpg --dearmor -o /etc/apt/keyrings/pgdg.gpg
+  chmod a+r /etc/apt/keyrings/pgdg.gpg
+  echo "deb [signed-by=/etc/apt/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+    > /etc/apt/sources.list.d/pgdg.list
+  apt-get update -qq
+fi
+
 # PostGIS comes from the same archive as Postgres, so both are covered by
 # unattended-upgrades. One package, no compiling.
 apt-get install -y -qq \
@@ -92,15 +106,31 @@ apply_setting maintenance_work_mem      "512MB"
 apply_setting max_connections           "100"
 apply_setting wal_level                 "replica"
 apply_setting max_wal_size              "2GB"
-# Checksums catch silent disk corruption early. For a register that cannot be
-# re-collected, that is worth a few percent of overhead.
-apply_setting data_checksums            "on"
 # Anything slower than half a second is worth looking at.
 apply_setting log_min_duration_statement "500"
 apply_setting log_checkpoints            "on"
 apply_setting log_line_prefix            "'%m [%p] %q%u@%d '"
 
 systemctl restart postgresql
+
+# Data checksums catch silent disk corruption, which for a register that
+# cannot be re-collected is worth a few percent of write overhead. They can
+# only be chosen when the cluster is created, NOT in postgresql.conf — it is
+# a read-only parameter and setting it there stops the server starting. So
+# the cluster is recreated, and only while it is still empty.
+CHECKSUMS=$(sudo -u postgres psql -tAc "SHOW data_checksums" 2>/dev/null || echo "off")
+if [[ "$CHECKSUMS" != "on" ]]; then
+  HAS_DB=$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'" 2>/dev/null || true)
+  if [[ -z "$HAS_DB" ]]; then
+    warn "Recreating the cluster with data checksums (it is still empty)"
+    pg_dropcluster --stop "$PG_VERSION" main
+    pg_createcluster --start -- --data-checksums "$PG_VERSION" main
+    systemctl restart postgresql
+  else
+    warn "Cluster has no data checksums and already holds ${DB_NAME}; leaving it alone."
+    warn "Enabling them later needs pg_checksums with the cluster stopped."
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 log "Database and role"
@@ -164,7 +194,10 @@ Type=simple
 User=${SERVICE_USER}
 Group=${SERVICE_USER}
 WorkingDirectory=${APP_DIR}
-EnvironmentFile=${APP_DIR}/.env
+# No EnvironmentFile on purpose. The application reads ${APP_DIR}/.env itself
+# through dotenv, which strips inline comments; systemd's parser does not, so
+# it would read "secret   # GENERATE" as the secret. One loader, one format.
+Environment=NODE_ENV=production
 ExecStart=/usr/bin/node ${APP_DIR}/src/server.js
 
 Restart=always
