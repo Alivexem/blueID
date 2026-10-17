@@ -50,7 +50,7 @@ apt-get install -y -qq \
   build-essential
 
 # ---------------------------------------------------------------------------
-log "PostgreSQL ${PG_VERSION} with PostGIS"
+log "PostgreSQL ${PG_VERSION}"
 # ---------------------------------------------------------------------------
 # The PostgreSQL Global Development Group archive. Ubuntu 24.04 ships 16 but
 # 22.04 ships 14, so pinning a version without this makes the script work on
@@ -66,12 +66,12 @@ if [[ ! -f /etc/apt/sources.list.d/pgdg.list ]]; then
   apt-get update -qq
 fi
 
-# PostGIS comes from the same archive as Postgres, so both are covered by
-# unattended-upgrades. One package, no compiling.
+# postgresql-contrib carries cube and earthdistance, which is all the
+# spatial support this register needs — it stores points and asks what is
+# near a place. No PostGIS.
 apt-get install -y -qq \
   "postgresql-${PG_VERSION}" \
   "postgresql-client-${PG_VERSION}" \
-  "postgresql-${PG_VERSION}-postgis-3" \
   "postgresql-contrib-${PG_VERSION}"
 
 systemctl enable --now postgresql
@@ -147,10 +147,11 @@ fi
 
 # The extensions the schema declares. Created here as superuser because
 # CREATE EXTENSION needs it; the migration then finds them already present.
-sudo -u postgres psql -d "$DB_NAME" -qc "CREATE EXTENSION IF NOT EXISTS pgcrypto;"
-sudo -u postgres psql -d "$DB_NAME" -qc "CREATE EXTENSION IF NOT EXISTS postgis;"
-sudo -u postgres psql -d "$DB_NAME" -qc "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
-sudo -u postgres psql -d "$DB_NAME" -tc "SELECT 'postgis ' || postgis_version();" | sed 's/^/    /'
+for ext in pgcrypto cube earthdistance pg_trgm; do
+  sudo -u postgres psql -d "$DB_NAME" -qc "CREATE EXTENSION IF NOT EXISTS ${ext};"
+done
+sudo -u postgres psql -d "$DB_NAME" -tc \
+  "SELECT '    ' || extname || ' ' || extversion FROM pg_extension ORDER BY extname;"
 
 # ---------------------------------------------------------------------------
 log "Node ${NODE_MAJOR}"

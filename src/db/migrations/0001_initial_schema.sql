@@ -12,9 +12,16 @@
 --      record per client id on replay.
 --
 --   2. Geography. Community and registration points were GeoJSON in a
---      document; here they are PostGIS `geography(Point,4326)`, so "within
---      5km of this landing site" is an indexed query rather than an
---      application-side filter.
+--      document; here they are plain latitude/longitude columns with a GiST
+--      index over `ll_to_earth()`, so "within 5km of this landing site" is an
+--      indexed query rather than an application-side filter.
+--
+--      Deliberately NOT PostGIS. The register stores points and asks one
+--      spatial question — what is near this place. `cube` and `earthdistance`
+--      answer it, ship with PostgreSQL itself, and need no extra package on
+--      the server. PostGIS is the right tool for polygons, projections and
+--      routing; carrying it for a radius search would be a dependency the
+--      system never uses.
 --
 --   3. Child collections become tables. Duplicate flags, landing sites and
 --      cooperative officers were embedded arrays. Each has its own lifecycle
@@ -33,9 +40,13 @@
 -- duplicate every list.
 
 -- pgcrypto supplies gen_random_uuid() on PostgreSQL 12; it is built in from
--- 13 onward. postgis supplies the geography type.
+-- 13 onward.
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
-CREATE EXTENSION IF NOT EXISTS postgis;
+-- cube + earthdistance give an indexed great-circle radius search. Both are
+-- contrib modules shipped with PostgreSQL, so there is nothing extra to
+-- install on the server.
+CREATE EXTENSION IF NOT EXISTS cube;
+CREATE EXTENSION IF NOT EXISTS earthdistance;
 -- Trigram matching backs the fuzzy name search used by duplicate detection.
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
@@ -165,7 +176,10 @@ CREATE TABLE communities (
   ward                   text,
   type                   text NOT NULL DEFAULT 'FISHING_VILLAGE',
 
-  location               geography(Point, 4326),
+  -- Both or neither; a half-set coordinate is a bug, not a partial record.
+  latitude               double precision,
+  longitude              double precision,
+  location_accuracy_m    numeric(8,2),
 
   facilities             jsonb NOT NULL DEFAULT
                            '{"landingSite":false,"coldStorage":false,"iceplant":false,
@@ -199,7 +213,8 @@ CREATE TABLE communities (
 CREATE UNIQUE INDEX community_code      ON communities (code) WHERE code IS NOT NULL;
 CREATE UNIQUE INDEX community_name_lga  ON communities (lga, normalized_name) WHERE NOT is_deleted;
 CREATE INDEX communities_lga            ON communities (lga) WHERE NOT is_deleted;
-CREATE INDEX communities_location       ON communities USING gist (location);
+CREATE INDEX communities_location       ON communities
+  USING gist (ll_to_earth(latitude, longitude)) WHERE latitude IS NOT NULL;
 CREATE INDEX communities_name_trgm      ON communities USING gin (name gin_trgm_ops);
 
 CREATE TRIGGER communities_touch BEFORE UPDATE ON communities
@@ -211,13 +226,15 @@ CREATE TABLE community_landing_sites (
   id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   community_id uuid NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
   name         text NOT NULL,
-  location     geography(Point, 4326),
+  latitude     double precision,
+  longitude    double precision,
   notes        text,
   created_at   timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE INDEX landing_sites_community ON community_landing_sites (community_id);
-CREATE INDEX landing_sites_location  ON community_landing_sites USING gist (location);
+CREATE INDEX landing_sites_location  ON community_landing_sites
+  USING gist (ll_to_earth(latitude, longitude)) WHERE latitude IS NOT NULL;
 
 -- ===========================================================================
 -- Cooperatives
@@ -358,7 +375,9 @@ CREATE TABLE fishermen (
   landing_site               text,
   address                    text,
   ward                       text,
-  location                   geography(Point, 4326),
+  latitude                   double precision,
+  longitude                  double precision,
+  location_accuracy_m        numeric(8,2),
 
   fisherman_types            text[] NOT NULL DEFAULT '{}',
   fishing_types              text[] NOT NULL DEFAULT '{}',
@@ -447,7 +466,8 @@ CREATE INDEX fishermen_cooperative  ON fishermen (cooperative_id) WHERE cooperat
 CREATE INDEX fishermen_registered_by ON fishermen (registered_by);
 CREATE INDEX fishermen_created_at   ON fishermen (created_at DESC);
 CREATE INDEX fishermen_updated_at   ON fishermen (updated_at, id);  -- sync keyset cursor
-CREATE INDEX fishermen_location     ON fishermen USING gist (location);
+CREATE INDEX fishermen_location     ON fishermen
+  USING gist (ll_to_earth(latitude, longitude)) WHERE latitude IS NOT NULL;
 CREATE INDEX fishermen_search       ON fishermen USING gin (search_vector);
 CREATE INDEX fishermen_types        ON fishermen USING gin (fisherman_types);
 CREATE INDEX fishermen_fishing      ON fishermen USING gin (fishing_types);
