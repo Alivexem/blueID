@@ -154,12 +154,34 @@ async function ping() {
  * duplicated benefit allocation months later.
  */
 function assertSingleInstance() {
+  /**
+   * On a serverless platform this check cannot mean anything.
+   *
+   * WEB_CONCURRENCY is 1 because each invocation is its own process — and
+   * there may be fifty of them. Passing the check would be false comfort,
+   * so it says plainly what is true instead: the cache, the rate limits and
+   * the sync lock are per-instance, and nothing here can enforce otherwise.
+   *
+   * That is acceptable for a test deployment and NOT for a production
+   * register: without a shared lock, two instances can process one device's
+   * sync batch at the same time, which is how a benefit gets allocated
+   * twice. A production deployment runs as a single long-lived process, or
+   * moves the lock into the database first.
+   */
+  if (process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME) {
+    logger.warn(
+      'Serverless runtime: cache, rate limits and the sync lock are per-instance and NOT shared. ' +
+        'Suitable for testing; a production register needs a shared lock before being scaled this way.'
+    );
+    return;
+  }
+
   const instances = Number(process.env.WEB_CONCURRENCY || process.env.INSTANCES || 1);
 
   if (config.isProduction && instances > 1) {
     throw new Error(
       `This build keeps its cache, rate limits and sync lock in process, so it must run as a single instance (found ${instances}). ` +
-        'To scale out, move the sync lock to a PostgreSQL advisory lock first — see OPERATIONS.md.'
+        'To scale out, move the sync lock to a shared store first — see OPERATIONS.md.'
     );
   }
 }

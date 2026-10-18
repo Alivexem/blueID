@@ -172,4 +172,29 @@ async function stop({ timeoutMs = 15000 } = {}) {
   logger.info({ remaining: active }, 'Background worker stopped');
 }
 
-module.exports = { start, stop, runJob, scheduleRecurring, WORKER_ID };
+/**
+ * Claims and runs exactly one job, then returns.
+ *
+ * Used where there is no polling worker — a serverless deployment drains
+ * the queue on ordinary traffic instead (see middleware/drainJobs.js).
+ * Claiming is the same atomic operation the worker uses, so this is safe to
+ * run from several instances at once: a job is handed to one of them.
+ *
+ * Returns false when the queue is empty, which is how the caller knows to
+ * stop rather than spinning.
+ */
+async function runOnce() {
+  const job = await OutboxJob.claimOne(WORKER_ID, { lockSeconds: LOCK_SECONDS });
+  if (!job) return false;
+
+  try {
+    await runJob(job);
+  } catch (err) {
+    // runJob records the failure and schedules a retry; anything reaching
+    // here is unexpected and must not stop the caller.
+    logger.error({ err, jobId: String(job._id) }, 'Unhandled error running a job inline');
+  }
+  return true;
+}
+
+module.exports = { start, stop, runJob, runOnce, scheduleRecurring, WORKER_ID };

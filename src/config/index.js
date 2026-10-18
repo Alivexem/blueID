@@ -119,8 +119,27 @@ const schema = z
     DOCS_PUBLIC: bool(false),
 
     MONGODB_URI: z.string().min(1, 'MONGODB_URI is required'),
-    MONGODB_MAX_POOL_SIZE: int(20),
-    MONGODB_MIN_POOL_SIZE: int(2),
+    /**
+     * Connections this process may hold open.
+     *
+     * Sized for serverless, where the number of PROCESSES is what varies:
+     * every warm instance keeps its own pool, so the cluster sees
+     * instances x maxPoolSize. MongoDB Atlas allows 500 on the free tier,
+     * so 5 leaves room for ~100 concurrent instances before anything is
+     * refused — and a refused connection surfaces as a failed request, not
+     * as a queue.
+     *
+     * A single long-running server is the opposite case: one process
+     * serving everything wants a larger pool. Raise this to 20 or so when
+     * deploying to a VM.
+     */
+    MONGODB_MAX_POOL_SIZE: int(5),
+    /**
+     * Zero, so an idle serverless instance holds nothing open. A warm
+     * instance that handles one request an hour would otherwise occupy
+     * connections for the other fifty-nine minutes.
+     */
+    MONGODB_MIN_POOL_SIZE: int(0),
 
     CACHE_PREFIX: z.string().default('blueid'),
     CACHE_TTL_SECONDS: int(300),

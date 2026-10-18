@@ -11,6 +11,7 @@ const { requestId, httpLogger } = require('./middleware/requestContext');
 const { attachPrincipal } = require('./middleware/authenticate');
 const { baseLimiter, authFailureGuard } = require('./middleware/rateLimiter');
 const { notFound, errorHandler } = require('./middleware/errorHandler');
+const { drainJobs } = require('./middleware/drainJobs');
 const { apiRouter, healthRoutes } = require('./routes');
 
 const app = express();
@@ -111,6 +112,10 @@ app.use(
   authFailureGuard,
   attachPrincipal,
   baseLimiter,
+  // Runs queued jobs after the response, and only when no worker process
+  // exists to run them — a serverless deployment has no long-lived process,
+  // so the queue drains on ordinary traffic instead.
+  drainJobs,
   apiRouter
 );
 
