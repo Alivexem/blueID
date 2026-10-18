@@ -172,9 +172,10 @@ const paths = {
       tags: ['Users'],
       summary: 'Invite an operator',
       description:
-        'Creates the account and emails an invitation. **No password is set here** — the person signs in through Firebase with this email, and that first sign-in binds their Firebase identity to this record.\n\n' +
-        'Binding requires a **verified** email, otherwise anyone able to sign up with an arbitrary address could claim a pending administrator invitation.\n\n' +
-        'You cannot create a role at or above your own, or assign an LGA outside your own scope.' + needs('user:manage'),
+        'Creates the account **with a credential** and emails an invitation.\n\n' +
+        'Omit `password` and the system generates a temporary one, returned **once** in this response as `temporaryPassword` and never recoverable afterwards. Pass it to the officer by whatever channel you trust; it is not emailed.\n\n' +
+        'Either way the account is flagged `mustChangePassword` — a generated one because nobody has chosen it yet, an administrator-supplied one because the administrator knows it. Until the holder replaces it their sign-in reaches only `/auth/change-password`, `/auth/logout`, `/auth/logout-all`, `/auth/sessions` and `/users/me`; everything else answers `403 PASSWORD_CHANGE_REQUIRED`. That is enforced server-side, not left to the client.\n\n' +
+        'You cannot create a role at or above your own, or assign an LGA outside your own scope. `SUPER_ADMIN` can therefore never be created here — it exists only via the server-side bootstrap command.' + needs('user:manage'),
       requestBody: {
         required: true,
         content: { 'application/json': { schema: { type: 'object',
@@ -191,14 +192,27 @@ const paths = {
             staffId: { type: 'string' }, designation: { type: 'string' },
           } } } },
       },
-      responses: { 201: okJson('Account created.', ref('User')), 401: R[401], 403: R[403], 409: R[409], 422: R[422] },
+      responses: {
+        201: okJson('Account created. A generated password appears here once.', {
+          type: 'object',
+          properties: {
+            user: ref('User'),
+            temporaryPassword: {
+              type: 'string',
+              description: 'Present only when the system generated it. Shown once; not recoverable.',
+            },
+            mustChangePassword: { type: 'boolean' },
+          },
+        }),
+        401: R[401], 403: R[403], 409: R[409], 422: R[422],
+      },
     },
   },
 
   '/api/v1/users/{id}': {
     get: {
       tags: ['Users'], summary: 'Get an operator',
-      description: 'Includes the Firebase identity view (disabled, email verified, last sign-in) when available.' + needs('user:manage'),
+      description: 'The account, its role and its geographic scope. Credential fields are never returned.' + needs('user:manage'),
       parameters: [idParam()],
       responses: { 200: okJson('Operator.', ref('User')), 401: R[401], 403: R[403], 404: R[404] },
     },
@@ -230,7 +244,9 @@ const paths = {
     patch: {
       tags: ['Users'], summary: 'Suspend or reinstate an operator',
       description:
-        'Suspending also revokes the account\'s Firebase refresh tokens, so it cannot mint a new ID token and the outstanding one is rejected on next use. You cannot change your own status or act on an account at or above your role.' + needs('user:manage'),
+        'Suspending revokes every live session for the account immediately, so an access token already in someone\'s hands stops working on its next request rather than when it expires. The status is re-read on every request, which is what makes that true.\n\n' +
+        'You cannot change your own status, or the status of an account at or above your own role.' +
+        needs('user:manage'),
       parameters: [idParam()],
       requestBody: { required: true, content: { 'application/json': { schema: { type: 'object',
         required: ['status', 'reason'],

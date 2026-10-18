@@ -590,10 +590,10 @@ const schemas = {
   User: {
     type: 'object',
     description:
-      'A portal/field-app OPERATOR — not a fisherman. Fishermen have no accounts. Credentials live in Firebase; this record carries role and geographic scope.',
+      'A portal/field-app OPERATOR — not a fisherman. Fishermen have no accounts; they are the subject of records, identified by their Blue ID. This service owns the credential: the password hash lives on this record and is never returned. The record also carries the role and geographic scope, which are re-read on every request so a demotion or suspension takes effect immediately.',
     properties: {
       id: { type: 'string', format: 'objectid' },
-      authUid: { type: 'string', nullable: true, description: 'Firebase subject. Null until the invited person first signs in.' },
+      authUid: { type: 'string', nullable: true, description: 'External identity-provider subject. Null in the default local mode, which is what this deployment runs; only used when AUTH_MODE is jwt or jwks.' },
       email: { type: 'string', format: 'email' },
       phone: { type: 'string' },
       firstName: { type: 'string' },

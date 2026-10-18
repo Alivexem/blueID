@@ -55,6 +55,8 @@ const ROLE_NOTES = {
   COOPERATIVE_OFFICER: 'Their own cooperative and its membership.',
 };
 
+const errorReference = require('./errors').toMarkdown();
+
 const roleTable = Object.values(ROLES)
   .map((r) => `| \`${r}\` | ${ROLE_PERMISSIONS[r].length} | ${ROLE_NOTES[r] || ''} |`)
   .join('\n');
@@ -104,10 +106,18 @@ a sign-out or password change invalidates outstanding access tokens at their nex
 
 ### Account protection
 
-- **8** consecutive failures locks the account for **15 minutes** (\`423 ACCOUNT_LOCKED\`).
-- Login is limited to **10 attempts per IP per 15 minutes**; password reset to **5 per hour**.
-- Every login failure returns the **same generic error**, so the endpoint cannot be used to discover
-  which addresses are registered. The real reason goes to the audit trail.
+- **8** consecutive failures locks that **account** for **15 minutes** (\`423 ACCOUNT_LOCKED\`),
+  wherever the attempts come from.
+- Rate limits come in **two tiers**, because one key cannot do both jobs. An LGA office sits behind a
+  single NAT: limit on the IP alone and one officer fumbling their password locks out the whole
+  building, which reads as an outage. Limit on the account alone and an attacker rotates accounts
+  freely. So login allows **10 attempts per account from one IP per 15 minutes**, under a ceiling of
+  **60 attempts from that IP across all accounts**. Password reset is **5 per hour per IP**.
+- A **wrong** login returns the **same generic error** whatever the cause, so the endpoint cannot be
+  used to discover which addresses are registered. The real reason goes to the audit trail. The one
+  exception is a **correct** password on a deactivated account, which answers
+  \`403 ACCOUNT_INACTIVE\` — a suspended officer needs to know why they cannot get in, rather than
+  concluding they have forgotten their password.
 - \`/auth/forgot-password\` always reports success for the same reason.
 
 ### Who has an account
@@ -162,13 +172,26 @@ change. Quote \`requestId\` when reporting a problem; it ties the response to th
 
 ---
 
+${errorReference}
+
+---
+
 ## Rate limits
 
-Limits are shared across instances and keyed to your account where one is known, otherwise to your
-IP. Responses carry \`RateLimit-Limit\`, \`RateLimit-Remaining\` and \`RateLimit-Reset\`.
+Keyed to your account where one is known, otherwise to your IP. Responses carry
+\`RateLimit-Limit\`, \`RateLimit-Remaining\` and \`RateLimit-Reset\`.
+
+Counters live in the application process, so they are per instance rather than shared. A single
+long-running deployment is therefore exact; a horizontally scaled or serverless one allows roughly
+the stated budget per instance. That is a deliberate trade for not running a second datastore, and
+the per-account lockout — which lives in the database — is the layer that holds regardless.
 
 | Surface | Budget |
 |---|---|
+| Sign in, per account from one IP | ${config.auth.loginAttemptsPerAccount} / 15 min |
+| Sign in, per IP across all accounts | ${config.auth.loginAttemptsPerIp} / 15 min |
+| Failed authentications, per identity | ${config.auth.maxFailuresPerWindow} / 15 min |
+| Password reset | 5 / hour per IP |
 | General | ${config.rateLimit.max} / ${config.rateLimit.windowMs / 60000} min |
 | Sync | ${config.rateLimit.syncMax} / min (deliberately generous — a device back from a week offline pushes many batches) |
 | Public verification | 30 / min per IP |
