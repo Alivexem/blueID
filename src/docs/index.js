@@ -41,6 +41,21 @@ const router = express.Router();
 const SWAGGER_VERSION = '5.33.3';
 const CDN = `https://cdn.jsdelivr.net/npm/swagger-ui-dist@${SWAGGER_VERSION}`;
 
+/**
+ * The CSP source is the CDN ORIGIN, not the pinned path.
+ *
+ * A source expression carrying a path is matched by the spec as follows: a
+ * path ending in `/` is a prefix, and a path NOT ending in `/` must match
+ * the resource exactly. `…/swagger-ui-dist@5.33.3` therefore permitted
+ * precisely one URL — that bare path — and blocked every file beneath it,
+ * which is every file the page actually loads.
+ *
+ * An origin with no path has no such trap. The version stays pinned where
+ * it matters, in the URLs below; the policy's job here is to name a host
+ * the page may load from, and it should say exactly that.
+ */
+const CDN_ORIGIN = 'https://cdn.jsdelivr.net';
+
 function docsGuard(req, res, next) {
   if (!config.isProduction || config.app.docsPublic) return next();
 
@@ -77,14 +92,22 @@ router.get('/', (req, res) => {
   const key = typeof req.query.key === 'string' ? req.query.key : '';
   const specUrl = `./json${key ? `?key=${encodeURIComponent(key)}` : ''}`;
 
+  /**
+   * `-elem` variants are set explicitly as well as the fallbacks. A browser
+   * falls back from `script-src-elem` to `script-src`, and says so in the
+   * console, which makes a path problem read like a directive problem.
+   * Naming both removes that ambiguity for whoever debugs this next.
+   */
   res.setHeader(
     'Content-Security-Policy',
     [
       "default-src 'none'",
-      `script-src 'self' ${CDN} 'unsafe-inline'`,
-      `style-src 'self' ${CDN} 'unsafe-inline'`,
-      `img-src 'self' data: ${CDN}`,
-      `font-src 'self' data: ${CDN}`,
+      `script-src 'self' ${CDN_ORIGIN} 'unsafe-inline'`,
+      `script-src-elem 'self' ${CDN_ORIGIN} 'unsafe-inline'`,
+      `style-src 'self' ${CDN_ORIGIN} 'unsafe-inline'`,
+      `style-src-elem 'self' ${CDN_ORIGIN} 'unsafe-inline'`,
+      `img-src 'self' data: ${CDN_ORIGIN}`,
+      `font-src 'self' data: ${CDN_ORIGIN}`,
       "connect-src 'self'",
       "base-uri 'self'",
       "form-action 'none'",
