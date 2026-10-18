@@ -51,14 +51,33 @@ const randomId = () => crypto.randomBytes(12).toString('hex');
  * record in an LGA; at state-wide scale that is the difference between a
  * directory listing that returns and one that does not.
  */
+/**
+ * Where each kind of image is filed.
+ *
+ * ONE PATH, NOT A FOLDER PLUS A PATH.
+ *
+ * Cloudinary concatenates `folder` with `public_id`, so passing both a
+ * folder and a path-style id produced `blueid/fishermen/BAK/fishermen/BAK/88/x`
+ * — the location repeated. The id carries the whole path, including the
+ * configured prefix, and no folder is sent.
+ *
+ * A fisherman's photograph is addressed by Blue ID, so a device retrying an
+ * upload overwrites its own earlier attempt instead of leaving an orphan —
+ * the same idempotency the record sync relies on. Assets and
+ * acknowledgements have no such natural key and get a random one.
+ *
+ * The two-character shard keeps any one folder from collecting every record
+ * in an LGA, which matters when browsing them in the Cloudinary console.
+ */
 function locate(kind, parts = {}) {
+  const prefix = config.cloudinary.folder ? `${config.cloudinary.folder}/` : '';
+
   switch (kind) {
     case 'fisherman': {
       const lga = slug(parts.lga, 'unassigned');
       const key = slug(parts.blueId || parts.clientRecordId || randomId());
       return {
-        publicId: `fishermen/${lga}/${shard(key)}/${key}`,
-        folder: `${config.cloudinary.folder}/fishermen/${lga}`,
+        publicId: `${prefix}fishermen/${lga}/${shard(key)}/${key}`,
         tags: ['fisherman', 'passport', parts.lga].filter(Boolean),
         square: true,
         maxEdge: 400,
@@ -69,8 +88,7 @@ function locate(kind, parts = {}) {
       const type = slug(parts.kind, 'asset').toLowerCase();
       const key = randomId();
       return {
-        publicId: `assets/${type}/${lga}/${shard(key)}/${key}`,
-        folder: `${config.cloudinary.folder}/assets/${type}/${lga}`,
+        publicId: `${prefix}assets/${type}/${lga}/${shard(key)}/${key}`,
         tags: [type, parts.lga, parts.ownerBlueId].filter(Boolean),
         square: false,
         maxEdge: 1024,
@@ -80,8 +98,7 @@ function locate(kind, parts = {}) {
       const programme = slug(parts.programmeCode, 'general');
       const key = parts.blueId ? `${slug(parts.blueId)}-${Date.now()}` : randomId();
       return {
-        publicId: `acknowledgements/${programme}/${shard(key)}/${key}`,
-        folder: `${config.cloudinary.folder}/acknowledgements/${programme}`,
+        publicId: `${prefix}acknowledgements/${programme}/${shard(key)}/${key}`,
         tags: ['acknowledgement', parts.programmeCode].filter(Boolean),
         square: false,
         maxEdge: 1200,
@@ -99,6 +116,28 @@ async function store(kind, buffer, parts, logContext) {
     return await storage.put(buffer, placement);
   } catch (err) {
     if (err instanceof ApiError) throw err;
+
+    /**
+     * A store that refuses the FILE is a client error, not a server fault.
+     *
+     * The upload middleware checks magic bytes, which a truncated or
+     * corrupt image can still satisfy — Cloudinary then rejects it with
+     * "Invalid image file". Returning 500 for that was wrong twice over: it
+     * blamed the server, and it told the field app to retry, so a device
+     * holding one corrupt photograph would retry it forever instead of
+     * flagging it to the enumerator.
+     */
+    const message = String(err?.message || '');
+    if (/invalid image|unsupported|corrupt|not an image/i.test(message)) {
+      logger.warn({ driver: storage.name, ...logContext, reason: message }, 'Upload refused: unusable image');
+      throw ApiError.badRequest('That image could not be read — retake the photograph', {
+        code: 'INVALID_IMAGE_CONTENT',
+      });
+    }
+    if (/file size|too large|maximum/i.test(message)) {
+      throw new ApiError(413, 'That image is too large', { code: 'PAYLOAD_TOO_LARGE' });
+    }
+
     logger.error({ err, driver: storage.name, ...logContext }, `${kind} upload failed`);
     throw ApiError.internal('Could not upload the image', { cause: err });
   }
