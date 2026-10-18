@@ -19,16 +19,65 @@ const config = require('../config');
  */
 const router = express.Router();
 
+/** Name of the short-lived cookie that carries the docs grant. */
+const DOCS_COOKIE = 'blueid_docs';
+const DOCS_COOKIE_TTL_SECONDS = 30 * 60;
+
+function readCookie(req, name) {
+  const header = req.headers.cookie;
+  if (!header) return null;
+  for (const part of header.split(';')) {
+    const [k, ...rest] = part.trim().split('=');
+    if (k === name) return decodeURIComponent(rest.join('='));
+  }
+  return null;
+}
+
+/**
+ * Guards the documentation in production.
+ *
+ * THE COOKIE IS NOT A CONVENIENCE, IT IS THE FIX.
+ *
+ * Swagger UI is an HTML page that then fetches its own stylesheet and
+ * scripts. A browser sends no `?key=` on those follow-up requests, so they
+ * were refused and the page rendered blank — the HTML arrived, nothing else
+ * did, and there was no error to see because a 404 on a stylesheet is
+ * silent.
+ *
+ * Letting static assets through unguarded is not an option: Swagger
+ * embeds the entire specification inside `swagger-ui-init.js`, so
+ * exempting `.js` would publish exactly what the guard exists to withhold.
+ *
+ * So a request that proves the key once is granted a short-lived cookie,
+ * and the asset requests that follow carry it. `httpOnly` keeps it away
+ * from page scripts, `sameSite=strict` keeps another site from using it,
+ * and the path confines it to the docs.
+ */
 function docsGuard(req, res, next) {
   if (!config.isProduction || config.app.docsPublic) return next();
 
-  const key = req.get('x-probe-key') || req.query.key;
   const { constantTimeEquals } = require('../middleware/authenticate');
+  const refuse = () =>
+    res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Not found' } });
 
-  if (config.app.probeKey && key && constantTimeEquals(key, config.app.probeKey)) {
+  if (!config.app.probeKey) return refuse();
+
+  const presented = req.get('x-probe-key') || req.query.key;
+  if (presented && constantTimeEquals(presented, config.app.probeKey)) {
+    res.cookie?.(DOCS_COOKIE, config.app.probeKey, {
+      httpOnly: true,
+      sameSite: 'strict',
+      secure: true,
+      maxAge: DOCS_COOKIE_TTL_SECONDS * 1000,
+      path: '/docs',
+    });
     return next();
   }
-  return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Not found' } });
+
+  const cookie = readCookie(req, DOCS_COOKIE);
+  if (cookie && constantTimeEquals(cookie, config.app.probeKey)) return next();
+
+  return refuse();
 }
 
 router.use(docsGuard);
