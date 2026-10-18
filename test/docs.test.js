@@ -20,7 +20,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const spec = require('../src/docs/openapi');
-const { ALL_CODES } = require('../src/docs/errors');
+const { ALL_CODES, GROUPS } = require('../src/docs/errors');
 
 const SRC = path.join(__dirname, '..', 'src');
 
@@ -164,4 +164,92 @@ test('the login documentation states the rate limits that are configured', () =>
     /per instance|per process/i.test(description),
     'the narrative should not imply rate limits are shared across instances'
   );
+});
+
+/**
+ * Every ApiError construction in the application, as code -> set of statuses.
+ *
+ * Attribution is paren-balanced: a `code:` literal counts against an
+ * `ApiError` call only while that call's argument list is still open. A
+ * nearest-preceding-match window was tried first and attributed codes to the
+ * wrong call, which is the same mistake that once made a guard test pass
+ * against a neighbouring route's middleware.
+ */
+function thrownStatuses() {
+  const METHOD = {
+    badRequest: 400, unauthorized: 401, forbidden: 403, notFound: 404,
+    conflict: 409, unprocessable: 422, tooMany: 429, internal: 500, unavailable: 503,
+  };
+  const out = new Map();
+
+  (function walk(dir) {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name !== 'docs') walk(full);
+        continue;
+      }
+      if (!entry.name.endsWith('.js')) continue;
+      const source = fs.readFileSync(full, 'utf8');
+
+      const calls = [];
+      for (const m of source.matchAll(/new ApiError\(\s*(\d{3})|ApiError\.(\w+)\(/g)) {
+        const status = m[1] ? Number(m[1]) : METHOD[m[2]];
+        if (status) calls.push({ at: m.index + m[0].length, status });
+      }
+
+      for (const m of source.matchAll(/code:\s*'([A-Z][A-Z0-9_]{3,})'/g)) {
+        for (let i = calls.length - 1; i >= 0; i -= 1) {
+          if (calls[i].at > m.index) continue;
+          const seg = source.slice(calls[i].at, m.index);
+          const depth = 1 + (seg.split('(').length - 1) - (seg.split(')').length - 1);
+          if (depth > 0) {
+            if (!out.has(m[1])) out.set(m[1], new Set());
+            out.get(m[1]).add(calls[i].status);
+          }
+          break;
+        }
+      }
+    }
+  })(SRC);
+
+  return out;
+}
+
+test('each documented status is the status the code actually returns', () => {
+  /**
+   * The code list was already guarded; the statuses next to it were not, and
+   * ten of them were wrong — DEVICE_REQUIRED documented 400 against a live
+   * 401, BATCH_TOO_LARGE 413 against 400, UNSUPPORTED_MEDIA_TYPE 415 against
+   * 400. A client written from that table branches on a status it will never
+   * see, and the mistake is invisible until someone compares them by hand.
+   */
+  const actual = thrownStatuses();
+  const documented = new Map(
+    GROUPS.flatMap(([, rows]) => rows.map(([code, status]) => [code, status]))
+  );
+
+  const wrong = [];
+  for (const [code, status] of documented) {
+    const thrown = actual.get(code);
+    if (thrown && !thrown.has(status)) {
+      wrong.push(`${code}: documented ${status}, code returns ${[...thrown].join(', ')}`);
+    }
+  }
+
+  assert.deepEqual(wrong, [], `the error reference disagrees with the code:\n  ${wrong.join('\n  ')}`);
+});
+
+test('no error code is returned with two different statuses', () => {
+  /**
+   * PAYLOAD_TOO_LARGE was thrown as 400 by the body-size handler and 413 by
+   * the image upload. A client cannot branch on either, and whichever it
+   * picks works until the request happens to fail the other way.
+   */
+  const actual = thrownStatuses();
+  const ambiguous = [...actual]
+    .filter(([, statuses]) => statuses.size > 1)
+    .map(([code, statuses]) => `${code}: ${[...statuses].sort().join(' and ')}`);
+
+  assert.deepEqual(ambiguous, [], `one code, several statuses:\n  ${ambiguous.join('\n  ')}`);
 });

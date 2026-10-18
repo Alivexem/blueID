@@ -87,7 +87,14 @@ function normalizeError(err) {
     return ApiError.badRequest('Request body is not valid JSON', { code: 'MALFORMED_JSON' });
   }
   if (err.type === 'entity.too.large') {
-    return ApiError.badRequest('Request body is too large', { code: 'PAYLOAD_TOO_LARGE' });
+    /**
+     * 413, not 400. This is the status the condition is named for, it is what
+     * body-parser itself reports on the error it raises, and it is what
+     * media.service.js already returns for an oversized image — the same
+     * `PAYLOAD_TOO_LARGE` code was arriving as 400 here and 413 there, so a
+     * client could not branch on either one consistently.
+     */
+    return new ApiError(413, 'Request body is too large', { code: 'PAYLOAD_TOO_LARGE' });
   }
 
   // Anything unrecognised is a bug, not an expected condition.

@@ -55,10 +55,10 @@ const BUSINESS_RULES = [
   ['ALREADY_VERIFIED', 409, 'A Blue ID has already been issued — possibly by someone else a moment ago.'],
   ['DUPLICATE_REVIEW_PENDING', 409, 'An unresolved duplicate flag blocks verification. Resolve it first; this is what stops a duplicate entering the benefit stream.'],
   ['INVALID_STATUS_TRANSITION', 409, 'That status cannot follow the current one. The lifecycle is a state machine: a deceased record cannot become active again, for example.'],
-  ['NOT_VERIFIED', 409, 'The action needs a verified record, and no Blue ID has been issued.'],
+  ['NOT_VERIFIED', 400, 'The action needs a verified record, and no Blue ID has been issued.'],
   ['PHOTO_REQUIRED', 400, 'A passport photograph must be attached before a Blue ID can be issued.'],
-  ['BLUE_ID_NOT_ISSUED', 409, 'A QR code cannot exist before the Blue ID it encodes.'],
-  ['NO_VERIFICATION_TOKEN', 409, 'The record has no card token yet — verify it first.'],
+  ['BLUE_ID_NOT_ISSUED', 400, 'A QR code cannot exist before the Blue ID it encodes.'],
+  ['NO_VERIFICATION_TOKEN', 400, 'The record has no card token yet — verify it first.'],
   ['BLUE_ID_REQUIRED', 400, 'A benefit can only be recorded against a verified fisherman.'],
   ['INVALID_IDENTIFIER', 400, 'The id is not a well-formed identifier.'],
   ['INVALID_FILTER_VALUE', 400, 'A query filter holds a value the field cannot take.'],
@@ -87,21 +87,21 @@ const REGISTERS = [
   ['COOPERATIVE_IN_USE', 409, 'The society still has members; deactivate rather than remove.'],
   ['ALREADY_A_MEMBER', 409, 'The fisherman already belongs to another cooperative.'],
   ['ASSET_ALREADY_REGISTERED', 409, 'That registration number or serial is already on file against another owner — a strong signal of a re-registration attempt.'],
-  ['OWNER_NOT_FOUND', 404, 'The fisherman this asset belongs to could not be found.'],
-  ['OWNER_UNRESOLVED', 422, 'The synced record does not say which fisherman it belongs to.'],
+  ['OWNER_NOT_FOUND', 400, 'The fisherman this asset belongs to could not be found.'],
+  ['OWNER_UNRESOLVED', 400, 'The synced record does not say which fisherman it belongs to.'],
 ];
 
 /** Offline sync and field devices. */
 const SYNC = [
-  ['DEVICE_REQUIRED', 400, 'The route needs an enrolled device; send `x-device-id`.'],
-  ['DEVICE_NOT_REGISTERED', 403, 'That device code is unknown.'],
-  ['DEVICE_NOT_ENROLLED', 403, 'The device has no active enrolment. Re-enrol it.'],
+  ['DEVICE_REQUIRED', 401, 'The route needs an enrolled device. Send `deviceCode` and `deviceSecret` in the body, or the `x-device-id` / `x-device-secret` headers.'],
+  ['DEVICE_NOT_REGISTERED', 401, 'That device code is unknown.'],
+  ['DEVICE_NOT_ENROLLED', 401, 'The device has no active enrolment. Re-enrol it. **Note:** this and the two codes above arrive as 401 even though the user\'s own token is fine — do not let a blanket 401 interceptor sign the officer out, because refreshing their token cannot fix a device problem.'],
   ['DEVICE_NOT_ACTIVE', 403, 'The device is suspended or revoked. Takes effect on the next request, not when a token expires.'],
   ['DEVICE_SECRET_INVALID', 401, 'The device secret does not match.'],
   ['DEVICE_CODE_TAKEN', 409, 'Another device already uses that code.'],
   ['SYNC_IN_PROGRESS', 409, 'Another push from this device is still running. Wait rather than retrying immediately.'],
   ['BATCH_IN_PROGRESS', 409, 'This batch is still being processed. Poll its status; do not resend.'],
-  ['BATCH_TOO_LARGE', 413, 'Split the batch. The limit is `SYNC_MAX_BATCH_SIZE` records.'],
+  ['BATCH_TOO_LARGE', 400, 'Split the batch. The limit is `SYNC_MAX_BATCH_SIZE` records.'],
   ['RECORD_INVALID', 422, 'A record inside the batch failed validation. The batch still completes; the payload is kept so it can be corrected rather than lost.'],
   ['UNSUPPORTED_ENTITY', 400, 'The batch names an entity type this endpoint does not accept.'],
 ];
@@ -110,7 +110,7 @@ const SYNC = [
 const MEDIA = [
   ['INVALID_IMAGE_CONTENT', 400, 'The bytes are not a recognised image, whatever the filename or content type said. Checked by magic number.'],
   ['MEDIA_TYPE_MISMATCH', 400, 'The declared content type does not match the actual bytes.'],
-  ['UNSUPPORTED_MEDIA_TYPE', 415, 'That image format is not accepted.'],
+  ['UNSUPPORTED_MEDIA_TYPE', 400, 'That image format is not accepted.'],
   ['MEDIA_UNAVAILABLE', 503, 'Media storage is not configured on this instance, so nothing can be uploaded.'],
   ['PAYLOAD_TOO_LARGE', 413, 'The body exceeds `MAX_UPLOAD_SIZE_MB`.'],
 ];

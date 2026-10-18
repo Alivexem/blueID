@@ -514,7 +514,26 @@ async function applyCreate(record, context, base) {
     );
 
     fisherman.syncedAt = new Date();
-    fisherman.clientRevision = record.clientRevision ?? 1;
+    /**
+     * Record the revision the client CLAIMED, and nothing more.
+     *
+     * This used to store `?? 1` when the device sent no revision, which
+     * invented a version the client had never claimed. The update path then
+     * held the device's own later edits stale against that invention —
+     * `incoming (absent -> 0) <= server (1)` — so an app that does not keep a
+     * revision counter could create records but never correct one. Every
+     * subsequent edit came back CONFLICT, "the server copy is newer and has
+     * been kept", forever, because the numbers could never cross.
+     *
+     * It is silent as far as the register is concerned: the push succeeds, the
+     * batch completes, and the officer's correction is simply gone.
+     *
+     * `clientRevision` is optional in the schema and every model defaults it
+     * to 0, so 0 is the honest value for "this client does not do revisions" —
+     * and it is what the `serverRevision > 0` guard in applyUpdate was already
+     * written to recognise.
+     */
+    fisherman.clientRevision = record.clientRevision ?? 0;
     if (!fisherman.tempReference) {
       fisherman.tempReference = blueIdService.temporaryReference(
         device?.deviceCode,
@@ -550,7 +569,9 @@ async function applyCreate(record, context, base) {
     registeredBy: actor._id,
     capturedAt: record.capturedAt,
     syncedAt: new Date(),
-    clientRevision: record.clientRevision ?? 1,
+    // Same reasoning as the fisherman branch above: store only what the
+    // client claimed, so its own later edits are not judged stale.
+    clientRevision: record.clientRevision ?? 0,
   });
 
   await auditService.recordChange({ action: AUDIT_ACTIONS.CREATE, doc, req, metadata: { viaSync: true } });

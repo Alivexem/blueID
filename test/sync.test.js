@@ -302,3 +302,117 @@ dbTest('a flagged duplicate is held for review, never deleted or merged', async 
 
   await Fisherman.deleteMany({ clientRecordId: { $in: [first, second] } });
 });
+
+// ---------------------------------------------------------------------------
+// S5b — an unversioned client must still be able to correct its own record
+// ---------------------------------------------------------------------------
+
+/**
+ * This goes through the real `push` service rather than reimplementing the
+ * staleness predicate, which is why it catches what S5 above could not.
+ *
+ * `clientRevision` is optional in the schema. The create path used to store
+ * `?? 1` for a device that sent none, inventing a revision the client never
+ * claimed; applyUpdate then compared the device's absent revision (read as 0)
+ * against that 1 and declared every later edit stale. An app with no revision
+ * counter could therefore register fishermen but never correct one — each
+ * correction returned CONFLICT, "the server copy is newer and has been kept",
+ * and the officer's change was silently discarded. The numbers could never
+ * cross, so it never recovered.
+ *
+ * The register is what proves it: the assertion is on the stored phone
+ * number, not on the reported outcome.
+ */
+dbTest('an edit from a client that sends no clientRevision is applied, not dropped', async () => {
+  const Fisherman = require('../src/modules/fishermen/fisherman.model');
+  const Device = require('../src/modules/sync/device.model');
+  const SyncBatch = require('../src/modules/sync/syncBatch.model');
+  const User = require('../src/modules/users/user.model');
+  const syncService = require('../src/modules/sync/sync.service');
+  const { USER_STATUS } = require('../src/config/constants');
+
+  const stamp = crypto.randomBytes(4).toString('hex').toUpperCase();
+  const clientRecordId = uuid();
+  const batchOne = uuid();
+  const batchTwo = uuid();
+
+  const actor = await User.create({
+    email: `rev-${stamp}@sync.test.invalid`.toLowerCase(),
+    firstName: 'Revision',
+    lastName: 'Probe',
+    role: ROLES.STATE_ADMIN,
+    status: USER_STATUS.ACTIVE,
+    authUid: `rev-uid-${stamp}`,
+    scope: { lgas: [] },
+  });
+
+  const device = new Device({ deviceCode: `REV${stamp}`, lga: 'BAK', assignedTo: actor._id });
+  const secret = device.issueSecret();
+  await device.save();
+
+  const cleanup = async () => {
+    await Fisherman.deleteMany({ clientRecordId });
+    await SyncBatch.deleteMany({ clientBatchId: { $in: [batchOne, batchTwo] } });
+    await Device.deleteOne({ _id: device._id });
+    await User.deleteOne({ _id: actor._id });
+  };
+
+  try {
+    // A device with no revision counter registers somebody.
+    const created = await syncService.push(
+      {
+        clientBatchId: batchOne,
+        deviceCode: device.deviceCode,
+        deviceSecret: secret,
+        records: [
+          {
+            clientRecordId,
+            entity: 'FISHERMAN',
+            operation: 'CREATE',
+            data: { ...validFisherman(), phone: '08030000001' },
+          },
+        ],
+      },
+      actor,
+      {}
+    );
+
+    assert.equal(created.batch.counts.created, 1, 'the registration itself must succeed');
+
+    // The same device corrects the phone number. It still sends no revision,
+    // because it does not implement them — which the schema permits.
+    const edited = await syncService.push(
+      {
+        clientBatchId: batchTwo,
+        deviceCode: device.deviceCode,
+        deviceSecret: secret,
+        records: [
+          {
+            clientRecordId,
+            entity: 'FISHERMAN',
+            operation: 'UPDATE',
+            data: { phone: '08030000002' },
+          },
+        ],
+      },
+      actor,
+      {}
+    );
+
+    assert.equal(
+      edited.batch.counts.conflicts,
+      0,
+      'a device editing its own record is not in conflict with anyone'
+    );
+    assert.equal(edited.batch.counts.updated, 1, 'the correction must be applied');
+
+    const stored = await Fisherman.findOne({ clientRecordId }).select('phone').lean();
+    assert.equal(
+      stored.phone,
+      '08030000002',
+      "the officer's correction must reach the register, not be silently discarded"
+    );
+  } finally {
+    await cleanup();
+  }
+});

@@ -45,7 +45,44 @@ function ready() {
   return connecting;
 }
 
+/**
+ * Let Express parse the query string, as it does everywhere else.
+ *
+ * Vercel's runtime assigns `req.query` itself, using Node's `querystring`,
+ * which has no notion of nesting: `cursors[FISHERMAN]=<cursor>` arrives as a
+ * flat key of that literal name and the object the sync API documents is
+ * never built.
+ *
+ * Express would normally parse it with qs, but its query middleware is
+ * guarded — `if (!req.query)` in express/lib/middleware/query.js — so a
+ * value the platform has already set is deliberately left alone. Vercel's
+ * flat parse therefore wins and Express's configured parser never runs.
+ *
+ * The divergence is what made this dangerous: under every test the real
+ * parser is in play, so `limit[a]=1` is a 422 locally and was a 200 on the
+ * deployment. The visible symptom was a device sending its pull cursor in
+ * bracket form being handed page one again, with `hasMore` still true and
+ * nothing in the response to say why it never progressed.
+ *
+ * Removing the own property lets the middleware do its job, so a deployed
+ * request is parsed exactly like a tested one. `qs` is not required directly
+ * here on purpose: it is only a transitive dependency of Express, and the
+ * point is to use whatever parser the app itself is configured with.
+ */
+function useExpressQueryParser(req) {
+  if (!Object.prototype.hasOwnProperty.call(req, 'query')) return;
+  try {
+    delete req.query;
+  } catch {
+    // Non-configurable, which no current runtime does. Leave the flat object
+    // in place rather than throwing: a request answered with a query the
+    // nested forms cannot reach beats a request that fails outright.
+  }
+}
+
 module.exports = async (req, res) => {
+  useExpressQueryParser(req);
+
   try {
     await ready();
   } catch (err) {
@@ -63,3 +100,6 @@ module.exports = async (req, res) => {
 
   app(req, res);
 };
+
+/** Exported for the test that proves a nested query survives the platform. */
+module.exports.useExpressQueryParser = useExpressQueryParser;

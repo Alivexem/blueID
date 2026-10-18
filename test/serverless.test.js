@@ -17,6 +17,8 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 const http = require('node:http');
+const fs = require('node:fs');
+const path = require('node:path');
 
 // No worker, as on Vercel. Set before config is read.
 process.env.WORKER_ENABLED = 'false';
@@ -30,9 +32,17 @@ process.env.WORKER_ENABLED = 'false';
  * Draining is only meaningful against a queue nobody else is using.
  */
 if (process.env.MONGODB_URI) {
-  const url = new URL(process.env.MONGODB_URI);
-  url.pathname = '/blueid_serverless_test';
-  process.env.MONGODB_URI = url.toString();
+  /**
+   * Swapped textually rather than with `new URL()`. A replica-set
+   * connection string lists several comma-separated hosts, which is not a
+   * valid WHATWG URL authority — `new URL()` threw ERR_INVALID_URL on it and
+   * took this whole file down before a single test ran, so the file could
+   * only ever be used against a single-host or +srv URI.
+   */
+  process.env.MONGODB_URI = process.env.MONGODB_URI.replace(
+    /^(mongodb(?:\+srv)?:\/\/[^/?]+)(?:\/[^?]*)?(\?.*)?$/,
+    (_match, head, query) => `${head}/blueid_serverless_test${query || ''}`
+  );
 }
 
 const database = require('../src/config/database');
@@ -145,4 +155,111 @@ test('the connection pool is sized for many instances, not one big server', () =
     0,
     'an idle instance should hold no connections open'
   );
+});
+
+// ---------------------------------------------------------------------------
+// Query parsing on the platform
+// ---------------------------------------------------------------------------
+
+/**
+ * Vercel's runtime sets `req.query` itself, with Node's `querystring`, which
+ * cannot express nesting. Express's query middleware is guarded by
+ * `if (!req.query)`, so it leaves a value the platform already set alone —
+ * meaning the app's configured qs parser never runs in production, and only
+ * in production.
+ *
+ * That divergence is the danger: `limit[a]=1` is a 422 under every test and
+ * was a 200 on the deployment, and a device sending its pull cursor as
+ * `cursors[FISHERMAN]=…` was silently handed page one again, with `hasMore`
+ * still true and no error to explain why it never progressed.
+ *
+ * These run a real request through a real Express app, with the platform's
+ * behaviour simulated, and assert on what the handler actually receives.
+ */
+function vercelStyleServer(onQuery) {
+  const express = require('express');
+  const { useExpressQueryParser } = require('../api/index');
+
+  const app = express();
+  app.get('/probe', (req, res) => {
+    onQuery(req.query);
+    res.json({ ok: true });
+  });
+
+  return http.createServer((req, res) => {
+    // What Vercel does before the function sees the request: parse the query
+    // with `querystring`, which flattens anything nested, and assign it.
+    const querystring = require('node:querystring');
+    const i = req.url.indexOf('?');
+    req.query = i === -1 ? {} : querystring.parse(req.url.slice(i + 1));
+
+    useExpressQueryParser(req);
+    app(req, res);
+  });
+}
+
+function getJson(origin_, path_) {
+  return new Promise((resolve, reject) => {
+    http
+      .get(`${origin_}${path_}`, (res) => {
+        let body = '';
+        res.on('data', (c) => { body += c; });
+        res.on('end', () => resolve({ status: res.statusCode, body }));
+      })
+      .on('error', reject);
+  });
+}
+
+test('a nested query parameter survives the platform and reaches the handler', async () => {
+  let seen = null;
+  const srv = vercelStyleServer((q) => { seen = q; });
+  await new Promise((r) => srv.listen(0, r));
+  const base = `http://127.0.0.1:${srv.address().port}`;
+
+  try {
+    await getJson(base, '/probe?entities=FISHERMAN&cursors%5BFISHERMAN%5D=abc123');
+
+    assert.deepEqual(
+      seen.cursors,
+      { FISHERMAN: 'abc123' },
+      'the handler must receive the nested object the sync API documents'
+    );
+    assert.equal(
+      seen['cursors[FISHERMAN]'],
+      undefined,
+      'and not the flat key, which no schema reads'
+    );
+  } finally {
+    await new Promise((r) => srv.close(r));
+  }
+});
+
+test('the pull schema sees a bracketed cursor, rather than silently ignoring it', async () => {
+  const { pullChanges } = require('../src/modules/sync/sync.validation');
+
+  let parsed = null;
+  const srv = vercelStyleServer((q) => { parsed = pullChanges.safeParse(q); });
+  await new Promise((r) => srv.listen(0, r));
+  const base = `http://127.0.0.1:${srv.address().port}`;
+
+  try {
+    await getJson(base, '/probe?entities=FISHERMAN&cursors%5BFISHERMAN%5D=abc123');
+    assert.equal(parsed.success, true);
+    assert.deepEqual(
+      parsed.data.cursors,
+      { FISHERMAN: 'abc123' },
+      'a cursor the device sent must reach the query, or the pull restarts from page one forever'
+    );
+
+    // The other half of the same divergence: a malformed nested value must
+    // fail here exactly as it does locally, instead of being answered 200.
+    await getJson(base, '/probe?entities=FISHERMAN&limit%5Ba%5D=1');
+    assert.equal(
+      parsed.success,
+      false,
+      'a nested value the schema cannot accept must be a validation error, not a silent 200'
+    );
+  } finally {
+    await new Promise((r) => srv.close(r));
+  }
 });
