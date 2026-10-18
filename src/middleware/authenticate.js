@@ -5,7 +5,6 @@ const jwt = require('jsonwebtoken');
 const { JwksClient } = require('jwks-rsa');
 const config = require('../config');
 const logger = require('../config/logger');
-const firebase = require('../config/firebase');
 const { USER_STATUS, ROLES } = require('../config/constants');
 const ApiError = require('../utils/ApiError');
 const asyncHandler = require('../utils/asyncHandler');
@@ -15,25 +14,25 @@ const { assertPasswordChanged } = require('./requirePasswordChange');
 /**
  * Identity boundary.
  *
- * Sign-in, sign-up, password reset and session refresh are owned entirely by
- * Firebase Authentication. This API never issues a token, never sees a
- * password and holds no session — it VERIFIES the ID token it is handed and
- * resolves it to a local user record.
+ * This service owns sign-in. It issues its own access and refresh tokens,
+ * holds the password hashes, and verifies the bearer token it is handed
+ * against its own signing secret. There is no external identity provider.
  *
- * ROLES AND SCOPE COME FROM MONGODB, NEVER FROM THE TOKEN.
+ * ROLES AND SCOPE COME FROM THE DATABASE, NEVER FROM THE TOKEN.
  *
- * Firebase custom claims would be the obvious place to put a role, and that is
- * precisely the trap: claims are baked into an ID token that stays valid for
- * up to an hour, so an administrator demoted five minutes ago would still
+ * Putting a role in the token would be the obvious shortcut and is precisely
+ * the trap: a claim is baked in when the token is minted and stays true for
+ * its whole life, so an administrator demoted five minutes ago would still
  * present an administrator token. Every request therefore re-reads the role
- * and the LGA scope from `users`, which makes a demotion or a suspension take
- * effect on the very next call.
+ * and the LGA scope from `users`, which makes a demotion or a suspension
+ * take effect on the very next call. The token carries identity only — the
+ * user id and the session id.
  *
  * Modes (AUTH_MODE):
- *   firebase  Firebase ID tokens (the deployment default)
+ *   local     this service verifies its own tokens (the deployment default)
  *   jwt       HS256 against a shared secret — internal/service tokens
  *   jwks      RS256 against a remote JWKS, with a pinned issuer and audience
- *   disabled  development only — trusts x-debug-* headers
+ *   disabled  development only — trusts x-debug-* headers, refused in production
  */
 
 let jwksClient = null;
@@ -63,10 +62,6 @@ const verifyOptions = () => ({
 
 /**
  * Verifies a bearer token and returns its claims.
- *
- * In `firebase` mode this delegates to the Admin SDK, which pins the audience
- * to the project and checks whether the token has been revoked — neither of
- * which a hand-rolled JWKS verification does by default.
  */
 async function verifyToken(token) {
   /**
@@ -90,16 +85,6 @@ async function verifyToken(token) {
       throw err;
     }
     return claims;
-  }
-
-  if (config.auth.mode === 'firebase') {
-    const decoded = await firebase.verifyIdToken(token);
-    return {
-      ...decoded,
-      sub: decoded.uid || decoded.sub,
-      uid: decoded.uid,
-      email_verified: decoded.email_verified === true,
-    };
   }
 
   return new Promise((resolve, reject) => {
@@ -128,24 +113,6 @@ function extractBearer(req) {
  * sign in again — branch on `code`, never on the message.
  */
 function translateAuthError(err) {
-  const firebaseCodes = {
-    'auth/id-token-expired': ['Session expired, please sign in again', 'TOKEN_EXPIRED'],
-    'auth/id-token-revoked': ['This session has been ended, please sign in again', 'TOKEN_REVOKED'],
-    'auth/user-disabled': ['This account has been disabled', 'ACCOUNT_DISABLED'],
-    'auth/user-not-found': ['This account no longer exists', 'ACCOUNT_NOT_FOUND'],
-    'auth/argument-error': ['Invalid authentication token', 'TOKEN_INVALID'],
-  };
-
-  if (err.code && firebaseCodes[err.code]) {
-    const [message, code] = firebaseCodes[err.code];
-    const status = code === 'TOKEN_EXPIRED' || code === 'TOKEN_REVOKED' ? 401 : 403;
-    return new ApiError(status, message, { code });
-  }
-  if (err.code === 'FIREBASE_NOT_CONFIGURED') {
-    return ApiError.unavailable('Authentication is not configured on this server', {
-      code: 'AUTH_NOT_CONFIGURED',
-    });
-  }
   if (err.code === 'WRONG_TOKEN_TYPE') {
     return new ApiError(401, 'Use an access token, not a refresh token', {
       code: 'WRONG_TOKEN_TYPE',

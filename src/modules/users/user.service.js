@@ -1,7 +1,6 @@
 'use strict';
 
 const User = require('./user.model');
-const firebase = require('../../config/firebase');
 const passwordUtil = require('../../utils/password');
 const authService = require('../auth/auth.service');
 const auditService = require('../../services/audit.service');
@@ -173,7 +172,7 @@ async function list(query, actor) {
   });
 }
 
-async function getById(id, actor, { includeIdentity = false } = {}) {
+async function getById(id, actor) {
   const user = await User.findOne({ _id: id, isDeleted: { $ne: true } })
     .populate('invitedBy', 'firstName lastName email')
     .populate('cooperative', 'name lga')
@@ -185,16 +184,6 @@ async function getById(id, actor, { includeIdentity = false } = {}) {
     if (!overlap) throw ApiError.forbidden('That user is outside your scope');
   }
 
-  /**
-   * The identity-provider view: is the account disabled, is its email
-   * verified, when did it last sign in. Useful when an administrator is
-   * investigating why someone cannot get in, and it comes from Firebase
-   * rather than being mirrored (and going stale) here.
-   */
-  if (includeIdentity && user.authUid) {
-    const identity = await firebase.getUser(user.authUid);
-    return { ...user.toJSON(), identity };
-  }
 
   return user;
 }
@@ -279,22 +268,7 @@ async function changeStatus(id, { status, reason }, actor, options = {}) {
   user.status = status;
   await user.save();
 
-  /**
-   * Keep the identity provider in step with the local decision.
-   *
-   * The local status is re-read on every request, so suspension already takes
-   * effect here immediately. Revoking at Firebase closes the other half: it
-   * invalidates the refresh token, so the account cannot mint a fresh ID token
-   * once the current one expires, and `verifyIdToken(..., checkRevoked)`
-   * rejects the outstanding one on its next use.
-   *
-   * Deliberately not awaited into the failure path — if Firebase is
-   * unreachable the officer is still blocked by the status check, and the
-   * failure is logged for follow-up rather than leaving the account active
-   * here because a remote call timed out.
-   */
   const deactivating = [USER_STATUS.SUSPENDED, USER_STATUS.DISABLED].includes(status);
-  let identityResult = null;
 
   /**
    * End every local session immediately. The status check on each request
@@ -310,19 +284,12 @@ async function changeStatus(id, { status, reason }, actor, options = {}) {
     );
   }
 
-  if (user.authUid) {
-    identityResult = deactivating
-      ? await firebase.revokeAccess(user.authUid, { disable: status === USER_STATUS.DISABLED })
-      : before.status !== USER_STATUS.ACTIVE && status === USER_STATUS.ACTIVE
-        ? await firebase.restoreAccess(user.authUid)
-        : null;
-  }
 
   await auditService.record({
     action: AUDIT_ACTIONS.STATUS_CHANGE,
     entity: { type: 'User', id: user._id, label: user.fullName },
     changes: auditService.diff(before, user.toObject()),
-    metadata: { reason, identityProvider: identityResult },
+    metadata: { reason },
     req,
   });
 

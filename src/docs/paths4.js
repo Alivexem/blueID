@@ -319,29 +319,10 @@ module.exports = {
         url: { type: 'string' }, expiresIn: { type: 'integer' } } }), 401: R[401], 403: R[403], 404: R[404] } },
   },
 
-  '/api/v1/media/file/{publicId}': {
-    get: { tags: ['Media'], summary: 'Fetch a stored image', security: [],
-      description:
-        'Serves the image bytes. **Only reachable with a valid signature** from `/media/signed-url`.\n\n' +
-        'This endpoint takes no bearer token on purpose: a browser rendering `<img src>` sends no `Authorization` header, so the HMAC in the query string is the authorisation. It is minted only after the caller has been authorised against the record the image belongs to, and expires in minutes.\n\n' +
-        'A missing, altered, expired or reused signature returns **404, not 403** — a 403 would confirm an image exists at that path, which is a membership oracle over the register.\n\n' +
-        'Only present when the deployment stores media locally (`MEDIA_DRIVER=local`).',
-      parameters: [
-        { name: 'publicId', in: 'path', required: true, schema: { type: 'string' },
-          description: 'Storage path, e.g. `fishermen/BAK/3f/CRS-BLU-BAK-000123.jpg`. Taken from the signed URL, never constructed by hand.' },
-        { name: 'e', in: 'query', required: true, schema: { type: 'integer' }, description: 'Expiry, Unix seconds.' },
-        { name: 's', in: 'query', required: true, schema: { type: 'string' }, description: 'base64url HMAC-SHA256 signature.' }],
-      responses: {
-        200: { description: 'The image.', content: { 'image/jpeg': { schema: { type: 'string', format: 'binary' } } } },
-        404: { description: 'No such image, or the signature is absent, altered or expired.' } } },
-  },
-
   '/api/v1/media/upload-signature': {
     post: { tags: ['Media'], summary: 'Credentials for a device upload',
       description:
-        'Returns what the field app needs to upload a photograph. **Branch on `strategy`:**\n\n' +
-        '- `api-upload` (local storage, the default) — this server is the store. POST the image to the returned `uploadUrl` with a bearer token.\n' +
-        '- `direct` (Cloudinary) — upload straight to the returned `uploadUrl` with the signature supplied, keeping a day of photographs off this API.\n\n' +
+        'Returns what the field app needs to upload a photograph straight to Cloudinary, in parallel with its record sync — a device returning from a week offline would otherwise queue a day of images behind this API.\n\n' +
         'The target id is derived server-side from the authorised record, so an upload cannot be aimed at someone else\'s asset.' + needs('fisherman:edit'),
       requestBody: { required: true, content: { 'application/json': { schema: { type: 'object',
         required: ['kind', 'id'],

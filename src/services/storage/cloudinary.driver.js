@@ -5,12 +5,11 @@ const config = require('../../config');
 const logger = require('../../config/logger');
 
 /**
- * Cloudinary media storage, kept behind the same interface as the local
- * driver so a deployment can move either way without touching a call site.
+ * Cloudinary media storage — the only driver on this branch.
  *
- * Retained as the alternative rather than deleted: it is the fallback if the
- * server's disk proves unworkable, and it is what existing records point at
- * until the migration script has run.
+ * Kept behind the storage interface rather than called directly from
+ * media.service, so swapping in a filesystem driver later is a file and a
+ * branch rather than a rewrite of every call site.
  */
 
 /**
@@ -49,9 +48,8 @@ function toMediaRecord(result) {
 }
 
 /**
- * `square` maps to a face-centred crop, matching what the local driver does
- * with sharp's attention strategy, so a passport photograph is framed the
- * same way whichever driver stored it.
+ * `square` maps to a face-centred crop, so a passport photograph is framed
+ * consistently however it was captured.
  */
 async function put(buffer, { publicId, square = false, maxEdge = 1024, folder, tags = [] } = {}) {
   const transformation = square
@@ -99,7 +97,7 @@ async function destroy(publicId) {
 /**
  * Credentials for a direct device -> Cloudinary upload, so a device coming
  * back online with a day of photographs does not push them all through the
- * API. The local driver has no equivalent; see media.service.js.
+ * API.
  */
 function createUploadSignature({ folder, publicId, tags = [] }) {
   const timestamp = Math.floor(Date.now() / 1000);

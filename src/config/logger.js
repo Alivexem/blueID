@@ -36,7 +36,6 @@ const redact = {
     'config.security.fieldEncryptionKey',
     'config.brevo.apiKey',
     'config.cloudinary.apiSecret',
-    'config.firebase.privateKey',
     'config.blueId.qrSecret',
     '*.privateKey',
     '*.apiKey',

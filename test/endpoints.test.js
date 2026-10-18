@@ -85,15 +85,6 @@ const PUBLIC_PATHS = new Set([
   '/logout',
   '/forgot-password',
   '/reset-password',
-  /**
-   * Image delivery. A browser putting a photograph in an `<img src>` sends no
-   * Authorization header, so the HMAC signature in the URL is the
-   * authorisation instead. It is minted only by `/media/signed-url`, after
-   * the caller has been authorised against the record the image belongs to,
-   * and it expires in minutes. Covered by test/storage.test.js, which proves
-   * an absent, altered, expired or reused signature is refused.
-   */
-  '/file/*',
 ]);
 
 test('the router exposes a non-trivial surface', () => {
@@ -178,7 +169,7 @@ test('production refuses unsafe configuration', () => {
     ['AUTH_MODE', 'disabled'],
     ['AUTH_AUTO_PROVISION', true],
     ['AUTH_REQUIRE_VERIFIED_EMAIL', false],
-    ['MEDIA_URL_SECRET', ''],
+    ['CLOUDINARY_API_SECRET', ''],
     ['FIELD_ENCRYPTION_KEY', ''],
     ['QR_SIGNING_SECRET', ''],
   ];

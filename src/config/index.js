@@ -85,7 +85,15 @@ const schema = z
      * access and refresh tokens, and handles reset. The other modes delegate
      * to an external provider and are kept for compatibility.
      */
-    AUTH_MODE: z.enum(['local', 'firebase', 'jwt', 'jwks', 'disabled']).default('local'),
+    /**
+     * How a caller proves who they are.
+     *
+     *   local     this service owns sign-in (the deployment default)
+     *   jwt       HS256 against a shared secret, for service tokens
+     *   jwks      RS256 against a remote JWKS, with a pinned issuer
+     *   disabled  development only; refused in production below
+     */
+    AUTH_MODE: z.enum(['local', 'jwt', 'jwks', 'disabled']).default('local'),
     AUTH_JWT_SECRET: z.string().default(''),
     AUTH_JWKS_URI: z.string().default(''),
     AUTH_JWT_ISSUER: z.string().default(''),
@@ -108,10 +116,6 @@ const schema = z
     AUTH_RESET_TOKEN_TTL_MINUTES: int(30),
     SERVICE_API_KEY: z.string().default(''),
 
-    // --- Firebase (identity provider only: no Firestore, no storage) --------
-    FIREBASE_PROJECT_ID: z.string().default(''),
-    FIREBASE_CLIENT_EMAIL: z.string().default(''),
-    FIREBASE_PRIVATE_KEY: z.string().default(''),
 
     BLUE_ID_PREFIX: z.string().default('CRS'),
     BLUE_ID_SEGMENT: z.string().default('BLU'),
@@ -128,34 +132,6 @@ const schema = z
     WORKER_POLL_INTERVAL_MS: int(2000),
     WORKER_MAX_ATTEMPTS: int(5),
     OUTBOX_BATCH_SIZE: int(50),
-
-    /**
-     * Where images live.
-     *
-     *   cloudinary  the managed service (this deployment's default)
-     *   local       the server's own filesystem
-     *
-     * `local` exists for a deployment that must keep citizen photographs
-     * inside Nigeria — NITDA's National Cloud Policy puts identity data in a
-     * tier that has to be stored in-country at rest. This build hosts with
-     * Cloudinary by the client's decision; switching is one variable, and
-     * src/scripts/migrateMedia.js moves the existing images.
-     */
-    MEDIA_DRIVER: z.enum(['local', 'cloudinary']).default('cloudinary'),
-    /** Absolute path, deliberately OUTSIDE the deploy directory. */
-    MEDIA_ROOT: z.string().default('/var/lib/blueid/media'),
-    /** Signs delivery URLs. Must differ from every other secret. */
-    MEDIA_URL_SECRET: z.string().default(''),
-    /** Longest edge for a stored asset photograph. */
-    MEDIA_MAX_EDGE: int(1024),
-    /** JPEG quality for stored images. */
-    MEDIA_JPEG_QUALITY: int(82),
-    /**
-     * Set when nginx fronts the app. Node then authorises the request and
-     * hands the file off with X-Accel-Redirect, so image bytes never pass
-     * through the event loop. Must match the nginx `internal` location.
-     */
-    MEDIA_XACCEL_PREFIX: z.string().default(''),
 
     CLOUDINARY_CLOUD_NAME: z.string().default(''),
     CLOUDINARY_API_KEY: z.string().default(''),
@@ -182,32 +158,28 @@ const schema = z
   .superRefine((env, ctx) => {
     const isProd = env.NODE_ENV === 'production';
 
+
     /**
-     * The local driver mints its own delivery URLs, so without a signing
-     * secret every stored photograph would be readable by anyone who could
-     * guess a path. Refuse to boot rather than serve the register's
-     * photographs unprotected.
+     * Media is not optional in production.
+     *
+     * A passport photograph is required before a Blue ID can be issued, so
+     * an instance that cannot store one cannot complete a registration —
+     * and the failure would surface in a village, mid-interview, rather
+     * than at deploy time.
      */
-    if (env.MEDIA_DRIVER === 'local' && !env.MEDIA_URL_SECRET) {
+    if (isProd && !env.CLOUDINARY_API_SECRET) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        path: ['MEDIA_URL_SECRET'],
+        path: ['CLOUDINARY_API_SECRET'],
         message:
-          'MEDIA_URL_SECRET is required when MEDIA_DRIVER=local — it signs the expiring image URLs',
+          'CLOUDINARY_API_SECRET is required in production — registration cannot complete without somewhere to store the photograph',
       });
     }
-    if (env.MEDIA_DRIVER === 'local' && env.MEDIA_URL_SECRET && env.MEDIA_URL_SECRET.length < 32) {
+    if (isProd && !env.CLOUDINARY_CLOUD_NAME) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        path: ['MEDIA_URL_SECRET'],
-        message: 'MEDIA_URL_SECRET must be at least 32 characters',
-      });
-    }
-    if (isProd && env.MEDIA_DRIVER === 'local' && !env.MEDIA_ROOT.startsWith('/')) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['MEDIA_ROOT'],
-        message: 'MEDIA_ROOT must be an absolute path in production',
+        path: ['CLOUDINARY_CLOUD_NAME'],
+        message: 'CLOUDINARY_CLOUD_NAME is required in production',
       });
     }
 
@@ -233,13 +205,6 @@ const schema = z
         message: 'AUTH_JWT_SECRET is required when AUTH_MODE=jwt',
       });
     }
-    if (env.AUTH_MODE === 'firebase' && !env.FIREBASE_PROJECT_ID) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['FIREBASE_PROJECT_ID'],
-        message: 'FIREBASE_PROJECT_ID is required when AUTH_MODE=firebase',
-      });
-    }
     if (env.AUTH_MODE === 'jwks') {
       if (!env.AUTH_JWKS_URI) {
         ctx.addIssue({
@@ -251,8 +216,7 @@ const schema = z
       /**
        * Without a pinned issuer and audience, a correctly signed token from
        * any tenant of the same provider verifies — with Google's shared
-       * signing keys that is every Firebase project in existence. Both are
-       * mandatory in this mode; `firebase` mode pins them automatically.
+       * signing keys the issuer serves. Both are mandatory in this mode.
        */
       if (!env.AUTH_JWT_ISSUER) {
         ctx.addIssue({
@@ -432,17 +396,6 @@ const config = {
     serviceApiKey: env.SERVICE_API_KEY,
   },
 
-  firebase: {
-    projectId: env.FIREBASE_PROJECT_ID,
-    clientEmail: env.FIREBASE_CLIENT_EMAIL,
-    privateKey: env.FIREBASE_PRIVATE_KEY,
-    // Admin operations (disable/revoke) need a real service account; token
-    // verification alone can work from Application Default Credentials.
-    enabled: Boolean(env.FIREBASE_PROJECT_ID),
-    hasServiceAccount: Boolean(
-      env.FIREBASE_PROJECT_ID && env.FIREBASE_CLIENT_EMAIL && env.FIREBASE_PRIVATE_KEY
-    ),
-  },
 
   blueId: {
     prefix: env.BLUE_ID_PREFIX,
@@ -465,14 +418,6 @@ const config = {
     outboxBatchSize: env.OUTBOX_BATCH_SIZE,
   },
 
-  media: {
-    driver: env.MEDIA_DRIVER,
-    root: env.MEDIA_ROOT,
-    urlSecret: env.MEDIA_URL_SECRET,
-    maxEdge: env.MEDIA_MAX_EDGE,
-    jpegQuality: env.MEDIA_JPEG_QUALITY,
-    xAccelPrefix: env.MEDIA_XACCEL_PREFIX,
-  },
 
   cloudinary: {
     cloudName: env.CLOUDINARY_CLOUD_NAME,

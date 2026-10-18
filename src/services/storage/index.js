@@ -1,34 +1,15 @@
 'use strict';
 
-const config = require('../../config');
-const logger = require('../../config/logger');
-
 /**
- * Picks the storage driver named by MEDIA_DRIVER.
+ * Media storage.
  *
- * Selected once at load rather than per call: switching stores under a
- * running process would leave half the day's uploads in one place and half in
- * the other, with nothing recording which went where.
+ * This deployment stores every image on Cloudinary, so that is the only
+ * driver here. `media.service.js` is written against this module rather than
+ * against Cloudinary directly, which keeps the seam that made swapping
+ * possible in the first place — a filesystem driver lives on the
+ * postgres-migration branch for a deployment that must keep citizen
+ * photographs inside Nigeria, and dropping it back in means adding a file
+ * and a branch in this one.
  */
 
-const drivers = {
-  local: () => require('./local.driver'),
-  cloudinary: () => require('./cloudinary.driver'),
-};
-
-const factory = drivers[config.media.driver];
-
-if (!factory) {
-  throw new Error(
-    `Unknown MEDIA_DRIVER "${config.media.driver}" — expected one of: ${Object.keys(drivers).join(', ')}`
-  );
-}
-
-const driver = factory();
-
-logger.info(
-  { driver: driver.name, ...(driver.name === 'local' ? { root: config.media.root } : {}) },
-  'Media storage driver selected'
-);
-
-module.exports = driver;
+module.exports = require('./cloudinary.driver');

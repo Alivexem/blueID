@@ -4,7 +4,6 @@ const express = require('express');
 const database = require('../../config/database');
 const cache = require('../../config/cache');
 const cloudinary = require('../../config/cloudinary');
-const mediaService = require('../../services/media.service');
 const config = require('../../config');
 const logger = require('../../config/logger');
 const asyncHandler = require('../../utils/asyncHandler');
@@ -84,24 +83,7 @@ async function collectChecks() {
     checks.cache = { status: 'error', kind: 'in-process', error: err.message };
   }
 
-  /**
-   * With the local driver this writes a probe file. A volume that is
-   * unmounted, full or read-only is otherwise discovered on the first upload
-   * of the working day, by an enumerator in a village, which is the worst
-   * possible moment and place to find out.
-   */
-  try {
-    const media = await mediaService.healthCheck();
-    checks.media = media.ok
-      ? { status: 'ok', driver: mediaService.driver }
-      : { status: 'error', driver: mediaService.driver, error: media.error };
-  } catch (err) {
-    checks.media = { status: 'error', driver: mediaService.driver, error: err.message };
-  }
-
-  if (config.media.driver === 'cloudinary') {
-    checks.cloudinary = { status: cloudinary.isEnabled() ? 'ok' : 'not configured' };
-  }
+  checks.cloudinary = { status: cloudinary.isEnabled() ? 'ok' : 'not configured' };
   checks.email = { status: config.brevo.enabled ? 'ok' : 'not configured' };
 
   /**
@@ -162,8 +144,6 @@ const readiness = asyncHandler(async (req, res) => {
     checks.mongodb.status === 'ok' &&
     checks.indexes?.status !== 'error' &&
     checks.cache?.status !== 'error' &&
-    // A register that cannot store a photograph cannot complete a
-    // registration, so this instance should not be taking traffic.
     checks.media?.status !== 'error';
 
   if (!healthy) {

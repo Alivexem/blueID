@@ -45,34 +45,7 @@ test('an unverified email is not treated as verified', () => {
 // Provider error mapping
 // ---------------------------------------------------------------------------
 
-test('Firebase auth errors map to stable client codes', () => {
-  const cases = [
-    ['auth/id-token-expired', 401, 'TOKEN_EXPIRED'],
-    ['auth/id-token-revoked', 401, 'TOKEN_REVOKED'],
-    ['auth/user-disabled', 403, 'ACCOUNT_DISABLED'],
-    ['auth/argument-error', 403, 'TOKEN_INVALID'],
-  ];
 
-  for (const [code, expectedStatus, expectedCode] of cases) {
-    const mapped = translateAuthError({ code });
-    assert.equal(mapped.code, expectedCode, `wrong code for ${code}`);
-    assert.equal(mapped.statusCode, expectedStatus, `wrong status for ${code}`);
-  }
-
-  // An expired JWT from the non-Firebase paths maps the same way, so the
-  // client can branch on one set of codes regardless of AUTH_MODE.
-  assert.equal(translateAuthError({ name: 'TokenExpiredError' }).code, 'TOKEN_EXPIRED');
-  // Anything unrecognised is an invalid token, never a 500.
-  assert.equal(translateAuthError(new Error('boom')).statusCode, 401);
-});
-
-test('a missing Firebase configuration surfaces as 503, not 401', () => {
-  // Misconfiguration is a server fault; reporting it as "bad credentials"
-  // would send officers chasing their own accounts.
-  const mapped = translateAuthError({ code: 'FIREBASE_NOT_CONFIGURED' });
-  assert.equal(mapped.statusCode, 503);
-  assert.equal(mapped.code, 'AUTH_NOT_CONFIGURED');
-});
 
 // ---------------------------------------------------------------------------
 // Roles come from MongoDB, never the token

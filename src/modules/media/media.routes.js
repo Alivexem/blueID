@@ -16,67 +16,10 @@ const {
   handleUploadError,
 } = require('../../middleware/upload');
 const { writeLimiter } = require('../../middleware/rateLimiter');
-const config = require('../../config');
 const { FOLDERS } = require('../../config/cloudinary');
 const { PERMISSIONS, AUDIT_ACTIONS } = require('../../config/constants');
 
 const router = express.Router();
-
-/**
- * Image delivery.
- *
- * Deliberately mounted BEFORE `authenticate`: the URL is handed to a browser
- * to put in an `<img src>`, and an image request carries no Authorization
- * header. The signature IS the authorisation, and it is only ever minted by
- * `/signed-url` below, after that caller has been checked against the record
- * the image belongs to. So the capability is delegated for a few minutes to
- * whoever holds the link, which is the same bargain the Cloudinary
- * `authenticated` URLs struck.
- *
- * Unsigned, expired or tampered requests get 404 rather than 403. A 403
- * would confirm that an image exists at that path, which is a membership
- * oracle over the register.
- */
-router.get(
-  '/file/*',
-  asyncHandler(async (req, res) => {
-    if (mediaService.driver !== 'local') throw ApiError.notFound('Not found');
-
-    const requested = String(req.params[0] || '');
-    const publicId = requested.replace(/\.(jpg|jpeg)$/i, '');
-
-    const ok = mediaService.verifySignature(publicId, req.query.e, req.query.s);
-    if (!ok) throw ApiError.notFound('Not found');
-
-    const storage = require('../../services/storage');
-
-    let absolute;
-    try {
-      absolute = storage.absolutePathFor(publicId);
-    } catch {
-      throw ApiError.notFound('Not found');
-    }
-
-    if (!(await storage.exists(publicId))) throw ApiError.notFound('Not found');
-
-    const remaining = Math.max(0, Number(req.query.e) - Math.floor(Date.now() / 1000));
-    res.set('Content-Type', 'image/jpeg');
-    res.set('Cache-Control', `private, max-age=${Math.min(300, remaining)}`);
-    res.set('X-Content-Type-Options', 'nosniff');
-
-    /**
-     * With nginx in front, hand the file off and let it do the sending: the
-     * bytes never enter the event loop, which matters when a day of field
-     * photographs is being rendered in a list view.
-     */
-    if (config.media.xAccelPrefix) {
-      res.set('X-Accel-Redirect', `${config.media.xAccelPrefix}/${publicId}.jpg`);
-      return res.end();
-    }
-
-    return res.sendFile(absolute);
-  })
-);
 
 router.use(authenticate);
 

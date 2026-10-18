@@ -32,11 +32,6 @@ async function globalSetup() {
   process.env.FIELD_ENCRYPTION_KEY = 'test-field-encryption-key-at-least-32-chars';
   process.env.SERVICE_API_KEY = 'test-service-api-key';
   process.env.HEALTH_PROBE_KEY = 'test-probe-key';
-  // Media is stored on the local filesystem; tests that touch it point
-  // MEDIA_ROOT at their own temporary directory.
-  process.env.MEDIA_DRIVER = process.env.MEDIA_DRIVER || 'local';
-  process.env.MEDIA_URL_SECRET =
-    process.env.MEDIA_URL_SECRET || 'test-media-url-signing-secret-at-least-32-chars';
   process.env.LOG_LEVEL = 'silent';
   // Workers are driven explicitly by the tests that cover them.
   process.env.WORKER_ENABLED = 'false';

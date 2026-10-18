@@ -144,29 +144,17 @@ function withSignedUrl(media, options) {
 }
 
 /**
- * Upload credentials for a field device.
+ * Credentials for a direct device upload.
  *
- * With Cloudinary this returns a signature for a direct device-to-service
- * upload, keeping a day's photographs off the API. The local driver has no
- * equivalent — the server IS the store — so it returns the endpoint to post
- * to instead. Clients must branch on `strategy`, which is why it is stated
- * explicitly rather than inferred from which fields are present.
+ * The field app pushes photographs straight to Cloudinary rather than
+ * through this API, in parallel with its record sync — a device returning
+ * from a week offline would otherwise queue a day of images behind the
+ * server. The target id is derived from the authorised record, so an upload
+ * cannot be aimed at someone else's asset.
  */
 function createUploadSignature({ folder, publicId, tags = [] } = {}) {
   assertEnabled();
-
-  if (typeof storage.createUploadSignature === 'function') {
-    return { strategy: 'direct', ...storage.createUploadSignature({ folder, publicId, tags }) };
-  }
-
-  return {
-    strategy: 'api-upload',
-    uploadUrl: `${config.app.baseUrl || ''}${config.app.apiPrefix}/media/upload`,
-    method: 'POST',
-    field: 'file',
-    maxBytes: config.cloudinary.maxUploadBytes,
-    note: 'This deployment stores media on its own server. Post the image to uploadUrl with a Bearer token; there is no third-party endpoint to upload to.',
-  };
+  return { strategy: 'direct', ...storage.createUploadSignature({ folder, publicId, tags }) };
 }
 
 /**
@@ -184,10 +172,6 @@ function deterministicPublicId(seed) {
   return crypto.createHash('sha1').update(String(seed)).digest('hex').slice(0, 20);
 }
 
-function verifySignature(publicId, expiresAt, signature) {
-  return storage.verifySignature(publicId, expiresAt, signature);
-}
-
 const isEnabled = () => storage.isEnabled();
 const healthCheck = () => storage.healthCheck();
 
@@ -198,7 +182,6 @@ module.exports = {
   createUploadSignature,
   signedUrl,
   withSignedUrl,
-  verifySignature,
   destroy,
   deterministicPublicId,
   healthCheck,
