@@ -255,7 +255,43 @@ const writeLimiter = createLimiter({
  */
 const AUTH_FAILURE_WINDOW_SECONDS = 15 * 60;
 
-const failureKey = (req) => `${config.cache.prefix}:authfail:${normaliseIp(req.ip)}`;
+/**
+ * Who is failing, as precisely as the request allows.
+ *
+ * A sign-in names an address; an authenticated request carries a verified
+ * principal. Anything else is anonymous and falls back to the IP alone.
+ */
+function failureIdentity(req) {
+  const email = String(req.body?.email || '')
+    .trim()
+    .toLowerCase();
+  if (email) return `e:${email}`;
+  if (req.principalId) return `u:${req.principalId}`;
+  return 'anon';
+}
+
+/**
+ * Two counters, for the same reason the login limiter has two.
+ *
+ * Keyed on the IP alone, twenty failures lock out everyone behind that
+ * address — and an LGA office is one NAT, so one officer fumbling their
+ * password twenty times would stop the whole building working, including
+ * colleagues typing the correct one. That is an outage, reported as the
+ * system being broken.
+ *
+ * Keyed on the identity alone, an attacker rotates identities and is never
+ * stopped.
+ *
+ * So the tight counter is per identity-at-this-IP, and a looser one caps
+ * the address as a whole to catch somebody working through a list.
+ */
+const failureKey = (req) =>
+  `${config.cache.prefix}:authfail:${normaliseIp(req.ip)}:${failureIdentity(req)}`;
+
+const failureIpKey = (req) => `${config.cache.prefix}:authfail-ip:${normaliseIp(req.ip)}`;
+
+/** The looser ceiling for one address across every identity it tries. */
+const IP_FAILURE_LIMIT = () => config.auth.maxFailuresPerWindow * 5;
 
 /** Called from the error handler whenever a 401/403 is produced. */
 async function recordAuthFailure(req) {
@@ -265,9 +301,11 @@ async function recordAuthFailure(req) {
 
     try {
       count = await incrementWithTtl(key, AUTH_FAILURE_WINDOW_SECONDS);
+      await incrementWithTtl(failureIpKey(req), AUTH_FAILURE_WINDOW_SECONDS);
     } catch {
       // Degrade to a per-process counter rather than losing the protection.
       count = localIncrement(key, AUTH_FAILURE_WINDOW_SECONDS * 1000);
+      localIncrement(failureIpKey(req), AUTH_FAILURE_WINDOW_SECONDS * 1000);
     }
 
     if (count === config.auth.maxFailuresPerWindow) {
@@ -285,6 +323,13 @@ async function recordAuthFailure(req) {
 
 /** Clears the counter once the caller proves they hold a valid token. */
 async function clearAuthFailures(req) {
+  /**
+   * Only the identity's own counter is cleared, not the address's.
+   *
+   * Proving you hold a valid token says nothing about the other failures
+   * from that IP, and clearing the shared counter would let an attacker
+   * reset it at will by signing in to one account they control.
+   */
   const key = failureKey(req);
   localCounters.delete(key);
   try {
@@ -298,15 +343,19 @@ async function clearAuthFailures(req) {
 async function authFailureGuard(req, res, next) {
   try {
     const key = failureKey(req);
+    const ipKey = failureIpKey(req);
     let count;
+    let ipCount;
 
     try {
       count = Number((await client.get(key)) ?? 0);
+      ipCount = Number((await client.get(ipKey)) ?? 0);
     } catch {
       count = localCounters.get(key)?.hits ?? 0;
+      ipCount = localCounters.get(ipKey)?.hits ?? 0;
     }
 
-    if (count >= config.auth.maxFailuresPerWindow) {
+    if (count >= config.auth.maxFailuresPerWindow || ipCount >= IP_FAILURE_LIMIT()) {
       res.setHeader('Retry-After', String(AUTH_FAILURE_WINDOW_SECONDS));
       return next(
         ApiError.tooMany('Too many failed authentication attempts — try again later', {

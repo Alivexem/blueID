@@ -21,12 +21,58 @@ const { z } = require('zod');
 const ROOT = path.resolve(__dirname, '..', '..');
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
-for (const file of [`.env.${NODE_ENV}.local`, '.env.local', '.env']) {
+/**
+ * Which env files are read, in order of precedence.
+ *
+ * `.env.local` is a developer's own file and is NOT read in production. If
+ * one ever reached the server — an rsync without excludes, a careless copy,
+ * a build context that swept it in — it would silently override the real
+ * configuration, and a weak development signing secret would be accepted
+ * without a word. The production checks below cannot catch that, because a
+ * short secret from a file looks identical to a short secret from the
+ * environment.
+ *
+ * In production the environment itself is the only source, plus a committed
+ * `.env` if the deployment uses one.
+ */
+const ENV_FILES =
+  NODE_ENV === 'production'
+    ? ['.env.production.local', '.env']
+    : [`.env.${NODE_ENV}.local`, '.env.local', '.env'];
+
+for (const file of ENV_FILES) {
   const full = path.join(ROOT, file);
   if (fs.existsSync(full)) {
     // dotenv does not override already-set vars, so earlier files win.
     dotenv.config({ path: full });
   }
+}
+
+/**
+ * Refuses a secret that is present but not actually secret.
+ *
+ * The guards below check that a value exists and is long enough. Neither
+ * catches the thing that actually happens: the placeholder from
+ * .env.example copied through to production, or a memorable string someone
+ * typed to get past a startup error. Both are long and both are public.
+ */
+const PLACEHOLDER_SECRETS = new Set([
+  'changeme', 'change-me', 'secret', 'password', 'test', 'placeholder',
+  'your-secret-here', 'replace-me', 'generate', 'xxxxxxxx',
+  'a-test-signing-secret-of-at-least-32-chars',
+  'test-qr-signing-secret-not-a-real-key',
+  'test-field-encryption-key-at-least-32-chars',
+]);
+
+function looksUnsafe(value) {
+  if (!value) return false;
+  const normalised = String(value).trim().toLowerCase();
+  if (PLACEHOLDER_SECRETS.has(normalised)) return true;
+  if (/^(generate|changeme|replace)/.test(normalised)) return true;
+  // A secret of one repeated character, or one with almost no distinct
+  // characters, is a keyboard mash rather than a generated key.
+  if (new Set(normalised).size < 8) return true;
+  return false;
 }
 
 /** Coerce "true"/"1"/"yes" to boolean. */
@@ -107,6 +153,18 @@ const schema = z
      */
     AUTH_REQUIRE_VERIFIED_EMAIL: bool(true),
     AUTH_MAX_FAILURES_PER_WINDOW: int(20),
+    /**
+     * Sign-in attempts allowed per 15 minutes for ONE address from one IP.
+     * Generous for a person who mistypes; tight for guessing one account.
+     */
+    AUTH_LOGIN_ATTEMPTS_PER_ACCOUNT: int(10),
+    /**
+     * Sign-in attempts allowed per 15 minutes from one IP across ALL
+     * addresses. An LGA office is behind a single NAT, so this has to hold
+     * a whole office's morning, while still stopping one address working
+     * through a list of accounts.
+     */
+    AUTH_LOGIN_ATTEMPTS_PER_IP: int(60),
     /** Access tokens are short-lived because they cannot be withdrawn. */
     AUTH_ACCESS_TOKEN_TTL: z.string().default('15m'),
     /** Refresh tokens are stored, so they can be revoked. */
@@ -158,6 +216,54 @@ const schema = z
   .superRefine((env, ctx) => {
     const isProd = env.NODE_ENV === 'production';
 
+
+    /**
+     * Every secret this service depends on must be a real one.
+     *
+     * The length checks below are necessary and not sufficient: a
+     * placeholder copied from .env.example is long, and so is a memorable
+     * phrase someone typed to get past a startup error. Both are public
+     * knowledge. Checked together so one failed deploy reports all of them
+     * rather than one per attempt.
+     */
+    if (isProd) {
+      const secrets = {
+        AUTH_JWT_SECRET: env.AUTH_JWT_SECRET,
+        FIELD_ENCRYPTION_KEY: env.FIELD_ENCRYPTION_KEY,
+        QR_SIGNING_SECRET: env.QR_SIGNING_SECRET,
+        HEALTH_PROBE_KEY: env.HEALTH_PROBE_KEY,
+        SERVICE_API_KEY: env.SERVICE_API_KEY,
+      };
+
+      for (const [name, value] of Object.entries(secrets)) {
+        if (value && looksUnsafe(value)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: [name],
+            message: `${name} looks like a placeholder or a typed-in value, not a generated secret. Use: openssl rand -base64 48`,
+          });
+        }
+      }
+
+      /**
+       * And they must differ from one another. Reusing one value means
+       * compromising any single use compromises all of them — the QR
+       * signing key is printed on thousands of cards and is the most
+       * likely of these to leak.
+       */
+      const present = Object.entries(secrets).filter(([, v]) => v);
+      const seen = new Map();
+      for (const [name, value] of present) {
+        if (seen.has(value)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: [name],
+            message: `${name} must not be the same value as ${seen.get(value)} — generate one secret per purpose`,
+          });
+        }
+        seen.set(value, name);
+      }
+    }
 
     /**
      * Media is not optional in production.
@@ -388,6 +494,8 @@ const config = {
     autoProvision: env.AUTH_AUTO_PROVISION,
     requireVerifiedEmail: env.AUTH_REQUIRE_VERIFIED_EMAIL,
     maxFailuresPerWindow: env.AUTH_MAX_FAILURES_PER_WINDOW,
+    loginAttemptsPerAccount: env.AUTH_LOGIN_ATTEMPTS_PER_ACCOUNT,
+    loginAttemptsPerIp: env.AUTH_LOGIN_ATTEMPTS_PER_IP,
     accessTokenTtl: env.AUTH_ACCESS_TOKEN_TTL,
     refreshTokenTtlDays: env.AUTH_REFRESH_TOKEN_TTL_DAYS,
     maxFailedLogins: env.AUTH_MAX_FAILED_LOGINS,
