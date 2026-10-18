@@ -105,24 +105,39 @@ function authPayload(user, accessToken, refreshToken, session) {
  * government addresses are registered. The specific reason goes to the log
  * and the audit trail, where an administrator can see it.
  */
-async function login({ email, password: plaintext }, options = {}) {
+async function login({ email, userId, password: plaintext }, options = {}) {
   const { req } = options;
   const genericFailure = () =>
-    new ApiError(401, 'Email address or password is incorrect', {
+    new ApiError(401, 'Those sign-in details are incorrect', {
       code: 'INVALID_CREDENTIALS',
     });
 
-  const normalisedEmail = String(email || '').trim().toLowerCase();
+  /**
+   * One identifier, two shapes.
+   *
+   * An address is matched on `email`; anything else on `staffId`, which is
+   * what the portal's "User ID" field holds. The staffId lookup uses a
+   * case-insensitive collation so "SuperAdmin" and "superadmin" are the
+   * same account — a login identifier that depends on capitalisation is a
+   * support ticket waiting to happen.
+   */
+  const raw = String(userId || email || '').trim();
+  const looksLikeEmail = raw.includes('@');
+  const identifier = looksLikeEmail ? raw.toLowerCase() : raw;
 
-  const user = await User.findOne({ email: normalisedEmail, isDeleted: { $ne: true } }).select(
-    '+passwordHash +failedLoginAttempts +lockedUntil'
-  );
+  const query = looksLikeEmail
+    ? { email: identifier, isDeleted: { $ne: true } }
+    : { staffId: identifier, isDeleted: { $ne: true } };
+
+  const user = await User.findOne(query)
+    .collation(looksLikeEmail ? undefined : { locale: 'en', strength: 2 })
+    .select('+passwordHash +failedLoginAttempts +lockedUntil');
 
   if (!user) {
     // Spend comparable time, so a missing account is not detectable by how
     // quickly the request comes back.
     await password.verify(null, plaintext);
-    logger.warn({ email: normalisedEmail, ip: req?.ip }, 'Sign-in attempt for an unknown address');
+    logger.warn({ identifier, ip: req?.ip }, 'Sign-in attempt for an unknown account');
     throw genericFailure();
   }
 

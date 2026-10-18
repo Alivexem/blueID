@@ -10,10 +10,35 @@ const email = z.string().trim().toLowerCase().email('Enter a valid email address
  * the way in (creation, change, reset); applying it here would tell an
  * attacker which of their guesses were even shaped like a real password.
  */
-const login = z.object({
-  email,
-  password: z.string().min(1, 'Enter your password').max(200),
-});
+/**
+ * Sign-in accepts EITHER an email address or a user id.
+ *
+ * The portal's administration section asks for "User ID" and "Password",
+ * because that is what an officer is given — a staff identifier, not an
+ * address. Accounts created by invitation are identified by email. Both
+ * must therefore work, so the field is one identifier and the service
+ * decides which it is.
+ *
+ * `userId` is NOT validated as an email, and not lowercased here: the
+ * lookup is case-insensitive at the database, so an officer typing
+ * "SuperAdmin" reaches the same account as "superadmin".
+ */
+const identifier = z
+  .string()
+  .trim()
+  .min(1, 'Enter your user ID or email address')
+  .max(200);
+
+const login = z
+  .object({
+    email: email.optional(),
+    userId: identifier.optional(),
+    password: z.string().min(1, 'Enter your password').max(200),
+  })
+  .refine((v) => Boolean(v.email || v.userId), {
+    message: 'Provide either a user ID or an email address',
+    path: ['userId'],
+  });
 
 const refresh = z.object({
   refreshToken: z.string().min(20, 'Provide the refresh token').max(500),

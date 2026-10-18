@@ -469,3 +469,84 @@ test('the documented bootstrap command produces an account that can sign in', as
   await Session.collection.deleteMany({ user: after.user.id });
   await User.collection.deleteMany({ email });
 });
+
+// ---------------------------------------------------------------------------
+// Signing in with a User ID
+// ---------------------------------------------------------------------------
+
+test('an officer can sign in with a User ID as well as an email', async () => {
+  /**
+   * The portal's administration section asks for "User ID" and "Password",
+   * because that is what an officer is handed. Accounts created by
+   * invitation are identified by email. Both have to work.
+   */
+  const password = 'Kudzu-Lantern-Marrow-4418';
+  const staffId = `cr-admin-${crypto.randomBytes(3).toString('hex')}`;
+  const holder = await User.create({
+    email: `${staffId}@auth.test.invalid`,
+    firstName: 'Staff',
+    lastName: 'Identifier',
+    role: ROLES.STATE_ADMIN,
+    status: USER_STATUS.ACTIVE,
+    staffId,
+    passwordHash: await passwordUtil.hash(password),
+    passwordChangedAt: new Date(),
+  });
+
+  // By User ID.
+  const byUserId = await call('POST', '/auth/login', { body: { userId: staffId, password } });
+  assert.equal(byUserId.status, 200, JSON.stringify(byUserId.body));
+  assert.equal(byUserId.body.data.user.email, holder.email);
+
+  // By email, still.
+  const byEmail = await call('POST', '/auth/login', { body: { email: holder.email, password } });
+  assert.equal(byEmail.status, 200);
+
+  // Capitalisation must not matter — a login identifier that depends on it
+  // is a support ticket waiting to happen.
+  const shouted = await call('POST', '/auth/login', {
+    body: { userId: staffId.toUpperCase(), password },
+  });
+  assert.equal(shouted.status, 200, 'the User ID lookup is case-insensitive');
+
+  // A wrong password against a valid User ID is the same generic failure.
+  const wrong = await call('POST', '/auth/login', { body: { userId: staffId, password: 'nope' } });
+  assert.equal(wrong.status, 401);
+  assert.equal(wrong.body.error.code, 'INVALID_CREDENTIALS');
+
+  // An unknown User ID is indistinguishable from a wrong password.
+  const unknown = await call('POST', '/auth/login', {
+    body: { userId: 'no-such-user-id', password: 'nope' },
+  });
+  assert.equal(unknown.body.error.code, wrong.body.error.code);
+  assert.equal(unknown.body.error.message, wrong.body.error.message);
+
+  await Session.collection.deleteMany({ user: holder._id });
+  await User.collection.deleteMany({ _id: holder._id });
+});
+
+test('a request with neither a User ID nor an email is rejected', async () => {
+  const neither = await call('POST', '/auth/login', { body: { password: 'something' } });
+  assert.equal(neither.status, 422);
+});
+
+test('two accounts cannot share a User ID', async () => {
+  // It is a login identifier: sharing one would make sign-in ambiguous and
+  // the service would silently pick whichever the index returned first.
+  const staffId = `clash-${crypto.randomBytes(3).toString('hex')}`;
+  const base = {
+    firstName: 'A',
+    lastName: 'B',
+    role: ROLES.ENUMERATOR,
+    status: USER_STATUS.ACTIVE,
+    staffId,
+  };
+  const first = await User.create({ ...base, email: `${staffId}-1@auth.test.invalid` });
+
+  await assert.rejects(
+    () => User.create({ ...base, email: `${staffId}-2@auth.test.invalid` }),
+    (err) => /duplicate key|E11000/i.test(err.message)
+  );
+
+  await User.collection.deleteMany({ _id: first._id });
+});

@@ -146,7 +146,29 @@ userSchema.index(
   { authUid: 1 },
   { unique: true, partialFilterExpression: { authUid: { $type: 'string' } }, name: 'user_auth_uid' }
 );
+
+
+/**
+ * The portal's "User ID".
+ *
+ * Unique when present, because it is a login identifier — two accounts
+ * sharing one would make sign-in ambiguous, and the service would silently
+ * pick whichever the index returned first. Partial, because accounts
+ * created by invitation are identified by email and have no staff id.
+ *
+ * Case-insensitive: an officer given "SuperAdmin" must not be locked out
+ * for typing "superadmin". The collation has to be declared on the index
+ * AND used by the query, which auth.service does.
+ */
 userSchema.index(
+  { staffId: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { staffId: { $type: 'string' } },
+    collation: { locale: 'en', strength: 2 },
+    name: 'user_staff_id',
+  }
+);userSchema.index(
   { email: 1 },
   { unique: true, partialFilterExpression: { email: { $type: 'string' } }, name: 'user_email' }
 );

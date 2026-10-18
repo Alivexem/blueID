@@ -40,7 +40,7 @@ module.exports = {
       summary: 'Sign in',
       security: [],
       description:
-        'Exchanges an email and password for an access token and a refresh token.\n\n' +
+        'Exchanges sign-in details for an access token and a refresh token.\n\n' + '**Send either `userId` or `email`.** The portal\'s administration section asks for "User ID" and Password, because that is what an officer is handed; accounts created by invitation are identified by their email address. Both work on this endpoint. The `userId` lookup is case-insensitive.\n\n' +
         '**A wrong password and an unknown address answer identically** — same status, same code, same message. Distinguishing them would turn this endpoint into an account-enumeration oracle, telling an attacker which government addresses are registered. The real reason is written to the audit trail, where an administrator can see it.\n\n' + 'The one exception is a **correct** password on a deactivated account, which answers `403 ACCOUNT_INACTIVE` rather than the generic failure. A suspended officer needs to know why they cannot sign in, or they conclude they have forgotten their password and the reset will not help them. A wrong password on that same account is still indistinguishable from any other failure.\n\n' +
         '**Lockout and rate limits, in three layers.** Eight consecutive failures hold that *account* shut for 15 minutes and return `423 ACCOUNT_LOCKED`, wherever the attempts come from. On top of that, this endpoint allows 10 attempts per *account from one IP* per 15 minutes, under a ceiling of 60 attempts from that IP across all accounts — two tiers, because an LGA office is behind one NAT and a single key would either lock out the whole building or let an attacker rotate accounts freely. Exceeding either returns `429`.\n\n' +
         '**Temporary credentials.** If `mustChangePassword` is true the sign-in succeeded, but the token it returned is good for only five routes — changing the password, listing and ending sessions, and reading your own profile. Everything else answers `403 PASSWORD_CHANGE_REQUIRED` until a password is chosen. This applies to every role, SUPER_ADMIN included.',
@@ -50,13 +50,28 @@ module.exports = {
           'application/json': {
             schema: {
               type: 'object',
-              required: ['email', 'password'],
+              required: ['password'],
+              description: 'Exactly one of `userId` or `email` is required.',
               properties: {
+                userId: {
+                  type: 'string',
+                  description: 'The staff identifier the portal labels "User ID". Case-insensitive.',
+                  example: 'superadmin',
+                },
                 email: { type: 'string', format: 'email' },
                 password: { type: 'string', format: 'password' },
               },
             },
-            example: { email: 'officer@crossriverstate.gov.ng', password: 'your-password' },
+            examples: {
+              byUserId: {
+                summary: 'Administration section — User ID and password',
+                value: { userId: 'superadmin', password: 'your-password' },
+              },
+              byEmail: {
+                summary: 'An invited officer — email and password',
+                value: { email: 'officer@crossriverstate.gov.ng', password: 'your-password' },
+              },
+            },
           },
         },
       },

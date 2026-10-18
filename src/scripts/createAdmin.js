@@ -5,7 +5,11 @@
  *
  *   npm run create:admin -- --email=ada@crossriverstate.gov.ng \
  *                           --first=Ada --last=Effiom \
- *                           --role=STATE_ADMIN [--lgas=BAK,AKP]
+ *                           --role=STATE_ADMIN [--lgas=BAK,AKP] \
+ *                           [--user-id=superadmin]
+ *
+ * `--user-id` sets the staff identifier the portal's administration section
+ * asks for as "User ID". Sign-in accepts it OR the email address.
  *
  * The account is created WITHOUT an identity-provider subject. It binds to a
  * real login the first time that person authenticates with a matching email,
@@ -34,6 +38,15 @@ async function run() {
   const email = (args.email || process.env.SEED_ADMIN_EMAIL || '').toLowerCase().trim();
   if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
     throw new Error('Provide a valid --email=<address>');
+  }
+
+  /**
+   * The portal's "User ID". Optional, and unique when set — it is a login
+   * identifier, so two accounts sharing one would make sign-in ambiguous.
+   */
+  const userId = (args['user-id'] || args.userId || '').trim() || undefined;
+  if (userId && !/^[A-Za-z0-9._-]{3,40}$/.test(userId)) {
+    throw new Error('--user-id must be 3-40 characters: letters, digits, dot, underscore or hyphen');
   }
 
   const role = (args.role || ROLES.STATE_ADMIN).toUpperCase();
@@ -72,6 +85,7 @@ async function run() {
     existing.role = role;
     existing.status = USER_STATUS.ACTIVE;
     if (lgas.length) existing.scope = { ...existing.scope, lgas };
+    if (userId) existing.staffId = userId;
     existing.passwordHash = await passwordUtil.hash(plaintext);
     existing.passwordChangedAt = new Date();
     existing.mustChangePassword = generated;
@@ -86,6 +100,7 @@ async function run() {
       role,
       status: USER_STATUS.ACTIVE,
       scope: { lgas, communities: [] },
+      staffId: userId,
       designation: args.designation,
       passwordHash: await passwordUtil.hash(plaintext),
       passwordChangedAt: new Date(),
@@ -99,8 +114,13 @@ async function run() {
     // Written to stdout rather than the log, so it is not captured by a log
     // shipper along with everything else.
     process.stdout.write(
-      `\n  Email:    ${email}\n  Password: ${plaintext}\n\n` +
-        '  This password is shown once and must be changed at first sign-in.\n\n'
+      `\n  Email:    ${email}\n` +
+        (userId ? `  User ID:  ${userId}\n` : '') +
+        `  Password: ${plaintext}\n\n` +
+        '  This password is shown once and must be changed at first sign-in.\n' +
+        (userId
+          ? '  Sign in with either the User ID or the email address.\n\n'
+          : '  Sign in with the email address.\n\n')
     );
   }
 
