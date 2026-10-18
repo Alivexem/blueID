@@ -623,6 +623,151 @@ async function updateIfUnchanged(id, data, expectedRevision, { client, derive } 
   return { updated: true, record: shape(rows[0]) };
 }
 
+// --- Duplicate flags (concept note section 10) -----------------------------
+//
+// An embedded array in Mongo; a table here, because a flag has its own
+// lifecycle — raised by matching, then reviewed and resolved by a named
+// administrator whose decision has to be attributable.
+
+/** Raises flags, ignoring any pair already open. */
+async function addDuplicateFlags(fishermanId, flags, { client } = {}) {
+  if (!flags?.length) return [];
+  const created = [];
+
+  for (const flag of flags) {
+    // ON CONFLICT against the symmetric partial index: a pair already under
+    // review is not flagged twice, in either direction.
+    // eslint-disable-next-line no-await-in-loop
+    const { rows } = await database.query(
+      `INSERT INTO fisherman_duplicate_flags (fisherman_id, candidate_id, score, reasons)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT DO NOTHING
+       RETURNING *`,
+      [fishermanId, flag.candidate || flag.candidateId, flag.score, flag.reasons || []],
+      client
+    );
+    if (rows.length) created.push(sql.mapRow(rows[0], { aliases: { fisherman_id: 'fisherman', candidate_id: 'candidate' } }));
+  }
+  return created;
+}
+
+/** Flags on a record, with enough of the candidate to review without a second call. */
+async function listDuplicateFlags(fishermanId, { client, status } = {}) {
+  const params = new sql.Params();
+  const conditions = [`d.fisherman_id = ${params.add(fishermanId)}`];
+  if (status) conditions.push(`d.status = ${params.add(status)}`);
+
+  const { rows } = await database.query(
+    `SELECT d.*, c.blue_id AS candidate_blue_id, c.full_name AS candidate_name,
+            c.lga AS candidate_lga, c.status AS candidate_status
+       FROM fisherman_duplicate_flags d
+       JOIN fishermen c ON c.id = d.candidate_id
+       ${sql.where(...conditions)}
+      ORDER BY d.score DESC, d.created_at DESC`,
+    params.values,
+    client
+  );
+  return rows.map((r) => sql.mapRow(r, { aliases: { fisherman_id: 'fisherman', candidate_id: 'candidate' } }));
+}
+
+async function findDuplicateFlag(flagId, { client } = {}) {
+  const { rows } = await database.query(
+    'SELECT * FROM fisherman_duplicate_flags WHERE id = $1',
+    [flagId],
+    client
+  );
+  return rows.length
+    ? sql.mapRow(rows[0], { aliases: { fisherman_id: 'fisherman', candidate_id: 'candidate' } })
+    : null;
+}
+
+/**
+ * Records an administrator's decision.
+ *
+ * Conditional on the flag still being PENDING, so two reviewers acting at
+ * once cannot both record a resolution — the second is told it was already
+ * decided rather than silently overwriting the first.
+ */
+async function resolveDuplicateFlag(flagId, { status, note, resolvedBy }, { client } = {}) {
+  const { rows } = await database.query(
+    `UPDATE fisherman_duplicate_flags
+        SET status = $2, resolution_note = $3, resolved_by = $4, resolved_at = now()
+      WHERE id = $1 AND status = 'PENDING'
+      RETURNING *`,
+    [flagId, status, note || null, resolvedBy || null],
+    client
+  );
+  return rows.length
+    ? sql.mapRow(rows[0], { aliases: { fisherman_id: 'fisherman', candidate_id: 'candidate' } })
+    : null;
+}
+
+/** Everything awaiting review, for the duplicates queue. */
+async function pendingDuplicateFlags({ lgas, limit = 50, offset = 0 } = {}, { client } = {}) {
+  const params = new sql.Params();
+  const conditions = [`d.status = 'PENDING'`, 'f.is_deleted = false'];
+  if (lgas?.length) conditions.push(`f.lga = ANY(${params.add(lgas)}::text[])`);
+
+  const { rows } = await database.query(
+    `SELECT d.*, f.blue_id, f.full_name, f.lga,
+            c.blue_id AS candidate_blue_id, c.full_name AS candidate_name,
+            count(*) OVER () AS __total
+       FROM fisherman_duplicate_flags d
+       JOIN fishermen f ON f.id = d.fisherman_id
+       JOIN fishermen c ON c.id = d.candidate_id
+       ${sql.where(...conditions)}
+      ORDER BY d.score DESC, d.created_at DESC
+      LIMIT ${Number(limit)} OFFSET ${Number(offset)}`,
+    params.values,
+    client
+  );
+  const total = rows.length ? Number(rows[0].__total) : 0;
+  return {
+    items: rows.map(({ __total, ...r }) =>
+      sql.mapRow(r, { aliases: { fisherman_id: 'fisherman', candidate_id: 'candidate' } })
+    ),
+    total,
+  };
+}
+
+/**
+ * Stamps the Blue ID onto a person's assets once it is issued.
+ *
+ * The assets carry a denormalised copy so a boat can be found by Blue ID
+ * without a join, and it is only correct if it is written when the number
+ * is issued.
+ */
+async function stampBlueIdOnAssets(ownerId, blueId, { client } = {}) {
+  const counts = {};
+  for (const table of ['boats', 'engines', 'equipment']) {
+    // eslint-disable-next-line no-await-in-loop
+    const { rowCount } = await database.query(
+      `UPDATE ${table} SET blue_id = $2 WHERE owner_id = $1 AND is_deleted = false`,
+      [ownerId, blueId],
+      client
+    );
+    counts[table] = rowCount;
+  }
+  return counts;
+}
+
+/** Moves every asset from one owner to another, used when records merge. */
+async function reassignAssets(fromOwnerId, toOwnerId, { blueId, lga }, { client } = {}) {
+  const counts = {};
+  for (const table of ['boats', 'engines', 'equipment']) {
+    // eslint-disable-next-line no-await-in-loop
+    const { rowCount } = await database.query(
+      `UPDATE ${table}
+          SET owner_id = $2, blue_id = coalesce($3, blue_id), lga = coalesce($4, lga)
+        WHERE owner_id = $1 AND is_deleted = false`,
+      [fromOwnerId, toOwnerId, blueId || null, lga || null],
+      client
+    );
+    counts[table] = rowCount;
+  }
+  return counts;
+}
+
 /** Test and seed support; bypasses the soft-delete convention deliberately. */
 async function hardDelete(filter = {}, { client } = {}) {
   const params = new sql.Params();
@@ -665,4 +810,11 @@ module.exports = {
   mergeInto,
   softDelete,
   hardDelete,
+  addDuplicateFlags,
+  listDuplicateFlags,
+  findDuplicateFlag,
+  resolveDuplicateFlag,
+  pendingDuplicateFlags,
+  stampBlueIdOnAssets,
+  reassignAssets,
 };

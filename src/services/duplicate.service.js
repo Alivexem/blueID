@@ -46,6 +46,13 @@ const WEIGHTS = Object.freeze({
   nextOfKinPhone: 0.12,
   boatRegistration: 0.2,
   engineSerial: 0.25,
+  /**
+   * Strong, but deliberately not decisive on its own. Perceptual hashes
+   * collide on genuinely different faces photographed against the same
+   * plain wall in the same light, which is every registration drive — so a
+   * photo match raises a record for review rather than condemning it.
+   */
+  photo: 0.5,
 });
 
 /**
@@ -74,6 +81,15 @@ function extractIdentity(input) {
     ninIndex,
     nextOfKinPhone: normalizePhone(input.nextOfKin?.phone),
     birthYear: input.match?.birthYear ?? resolveBirthYear(input),
+    /**
+     * Perceptual hash of the passport photograph.
+     *
+     * Section 10 of the concept note names the photograph as one of seven
+     * duplicate signals, and it is the one that catches the case the others
+     * miss: the same man re-registering under a different name, with a
+     * different phone, and no NIN on either record.
+     */
+    photoHash: input.match?.photoHash ?? input.photoHash ?? null,
     lga: input.lga,
     community: input.community ? String(input.community) : null,
   };
@@ -87,37 +103,26 @@ function extractIdentity(input) {
  * double registration is overwhelmingly likely to occur.
  */
 function buildCandidateQuery(identity, excludeId) {
-  const or = [];
+  // The blocking signals. Each has an index behind it in the schema, which
+  // is what keeps this cheap once the register holds tens of thousands of
+  // records — without it every registration would scan the whole table.
+  const hasSignal =
+    identity.ninIndex || identity.phone || identity.altPhone || identity.photoHash ||
+    (identity.phoneticName && identity.lga);
 
-  if (identity.ninIndex) or.push({ 'match.ninIndex': identity.ninIndex });
+  if (!hasSignal) return null;
 
-  if (identity.phone) {
-    or.push({ 'match.normalizedPhone': identity.phone });
-    or.push({ 'match.normalizedAltPhone': identity.phone });
-  }
-  if (identity.altPhone) {
-    or.push({ 'match.normalizedPhone': identity.altPhone });
-  }
-
-  if (identity.phoneticName && identity.lga) {
-    or.push({ lga: identity.lga, 'match.phoneticName': identity.phoneticName });
-  }
-  if (identity.normalizedName && identity.birthYear) {
-    or.push({ 'match.normalizedName': identity.normalizedName, 'match.birthYear': identity.birthYear });
-  }
-
-  if (!or.length) return null;
-
-  const query = {
-    $or: or,
-    isDeleted: { $ne: true },
-    // A record already under review or merged away is not a new finding.
-    status: { $nin: [FISHERMAN_STATUS.DUPLICATE_UNDER_REVIEW] },
-    mergedInto: { $exists: false },
+  return {
+    ninIndex: identity.ninIndex,
+    phone: identity.phone,
+    altPhone: identity.altPhone,
+    // The photograph signal the concept note names in section 10 and the
+    // previous implementation never used.
+    photoHash: identity.photoHash,
+    phoneticName: identity.phoneticName,
+    lga: identity.lga,
+    excludeId,
   };
-  if (excludeId) query._id = { $ne: excludeId };
-
-  return query;
 }
 
 /** Stage 2 — score one candidate against the subject. */
@@ -136,6 +141,11 @@ function scoreCandidate(subject, candidate) {
   if (subjectPhones.some((p) => otherPhones.includes(p))) {
     score += WEIGHTS.phone;
     reasons.push('Same phone number');
+  }
+
+  if (subject.photoHash && other.photoHash && subject.photoHash === other.photoHash) {
+    score += WEIGHTS.photo;
+    reasons.push('Photograph appears to be the same person');
   }
 
   const similarity = nameSimilarity(subject.normalizedName, other.normalizedName);
@@ -178,7 +188,7 @@ function scoreCandidate(subject, candidate) {
   }
 
   return {
-    candidateId: candidate._id,
+    candidateId: candidate.id,
     blueId: candidate.blueId,
     fullName: candidate.fullName,
     lga: candidate.lga,
@@ -197,20 +207,15 @@ function scoreCandidate(subject, candidate) {
  * above the configured threshold.
  */
 async function findDuplicates(input, { excludeId, limit = 10, threshold } = {}) {
-  // Required late to avoid a circular import (the model does not depend on
-  // this service, but the service's callers are loaded from the model's module).
-  const Fisherman = require('../modules/fishermen/fisherman.model');
+  const fishermen = require('../modules/fishermen/fisherman.repository');
 
   const subject = extractIdentity(input);
   const query = buildCandidateQuery(subject, excludeId);
   if (!query) return { matches: [], highestScore: 0, hasDuplicate: false };
 
-  const candidates = await Fisherman.find(query)
-    .select(
-      'blueId fullName lga community communityName status photo match nextOfKin dateOfBirth estimatedYearOfBirth'
-    )
-    .limit(100) // blocking should keep this small; cap it defensively
-    .lean();
+  // Blocking should keep this small; the cap is defensive, for the case
+  // where a shared handset puts hundreds of records on one phone number.
+  const candidates = await fishermen.findDuplicateCandidates(query, { limit: 100 });
 
   const effectiveThreshold = threshold ?? config.duplicates.threshold;
 
@@ -259,14 +264,11 @@ async function findAssetConflicts({ boatRegistrationNumber, engineSerialNumber, 
   const conflicts = [];
 
   if (boatRegistrationNumber) {
-    const Boat = require('../modules/assets/boat.model');
-    const existing = await Boat.findOne({
-      registrationNumber: boatRegistrationNumber.toUpperCase(),
-      isDeleted: { $ne: true },
-      ...(excludeOwnerId ? { owner: { $ne: excludeOwnerId } } : {}),
-    })
-      .select('owner blueId registrationNumber')
-      .lean();
+    const boats = require('../modules/assets/boat.repository');
+    const found = await boats.findByRegistrationNumber(boatRegistrationNumber.toUpperCase());
+    // A hit against the SAME owner is this person's own boat, not a conflict.
+    const existing =
+      found && (!excludeOwnerId || String(found.owner) !== String(excludeOwnerId)) ? found : null;
     if (existing) {
       conflicts.push({
         type: 'BOAT_REGISTRATION',
@@ -279,14 +281,10 @@ async function findAssetConflicts({ boatRegistrationNumber, engineSerialNumber, 
   }
 
   if (engineSerialNumber) {
-    const Engine = require('../modules/assets/engine.model');
-    const existing = await Engine.findOne({
-      serialNumber: engineSerialNumber.toUpperCase(),
-      isDeleted: { $ne: true },
-      ...(excludeOwnerId ? { owner: { $ne: excludeOwnerId } } : {}),
-    })
-      .select('owner blueId serialNumber')
-      .lean();
+    const engines = require('../modules/assets/engine.repository');
+    const found = await engines.findBySerialNumber(engineSerialNumber.toUpperCase());
+    const existing =
+      found && (!excludeOwnerId || String(found.owner) !== String(excludeOwnerId)) ? found : null;
     if (existing) {
       conflicts.push({
         type: 'ENGINE_SERIAL',

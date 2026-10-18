@@ -1,11 +1,12 @@
 'use strict';
 
-const Fisherman = require('./fisherman.model');
-const Community = require('../communities/community.model');
-const Boat = require('../assets/boat.model');
-const Engine = require('../assets/engine.model');
-const Equipment = require('../assets/equipment.model');
-const Allocation = require('../programmes/allocation.model');
+const fishermenRepo = require('./fisherman.repository');
+const { deriveMatchKeys, revealNin } = require('./fisherman.derive');
+const communityRepo = require('../communities/community.repository');
+const boatRepo = require('../assets/boat.repository');
+const engineRepo = require('../assets/engine.repository');
+const equipmentRepo = require('../assets/equipment.repository');
+const allocationRepo = require('../programmes/allocation.repository');
 
 const blueIdService = require('../../services/blueId.service');
 const duplicateService = require('../../services/duplicate.service');
@@ -61,7 +62,7 @@ const PROTECTED_FIELDS = ['blueId', 'status', 'verification', 'duplicateFlags', 
 
 async function resolveCommunity(communityId, lga) {
   if (!communityId) return null;
-  const community = await Community.findById(communityId).select('name lga location').lean();
+  const community = await communityRepo.findById(communityId);
   if (!community) throw ApiError.badRequest('Unknown community', { code: 'UNKNOWN_COMMUNITY' });
   if (lga && community.lga !== lga) {
     throw ApiError.badRequest('The selected community is not in that Local Government Area', {
@@ -106,19 +107,23 @@ async function create(payload, actor, options = {}) {
     lga,
     communityName: community?.name || payload.communityName,
     registrationChannel: channel,
-    registeredBy: actor._id,
-    device: device?._id,
+    registeredBy: actor.id || actor._id,
+    device: device?.id || device?._id,
     capturedAt: payload.capturedAt || new Date(),
     status: FISHERMAN_STATUS.PENDING_VERIFICATION,
   };
 
   // --- Duplicate screening (§10) -------------------------------------------
   let duplicates = { matches: [], hasDuplicate: false };
+  let pendingFlags = [];
   if (!options.skipDuplicateCheck) {
     duplicates = await duplicateService.findDuplicates(draft);
     if (duplicates.hasDuplicate) {
       draft.status = FISHERMAN_STATUS.DUPLICATE_UNDER_REVIEW;
-      draft.duplicateFlags = duplicateService.buildFlags(duplicates.matches, 'REGISTRATION');
+      // Flags are rows now, so they are written after the record exists —
+      // inside the same transaction, so a flagged registration can never
+      // commit without its flags.
+      pendingFlags = duplicateService.buildFlags(duplicates.matches, 'REGISTRATION');
     }
   }
 
@@ -131,17 +136,22 @@ async function create(payload, actor, options = {}) {
    * the outbox pattern exists to close, and closing it requires the job row
    * to be written inside this transaction.
    */
-  const fisherman = new Fisherman(draft);
+  let fisherman;
 
-  await database.withTransaction(async (txSession) => {
-    const activeSession = session || txSession;
-    await fisherman.save(activeSession ? { session: activeSession } : {});
+  await database.withTransaction(async (txClient) => {
+    const client = session || txClient;
+
+    fisherman = await fishermenRepo.create(draft, { client, derive: deriveMatchKeys });
+
+    if (pendingFlags.length) {
+      await fishermenRepo.addDuplicateFlags(fisherman.id, pendingFlags, { client });
+    }
 
     if (duplicates.hasDuplicate) {
       await queue.enqueue(
         queue.JOB_TYPES.DUPLICATE_REVIEW_NOTIFY,
         {
-          fishermanId: String(fisherman._id),
+          fishermanId: String(fisherman.id),
           lga,
           matches: duplicates.matches.map((m) => ({
             blueId: m.blueId,
@@ -150,13 +160,14 @@ async function create(payload, actor, options = {}) {
             reasons: m.reasons,
           })),
         },
-        { dedupeKey: `dup-notify:${fisherman._id}`, session: activeSession, req }
+        { dedupeKey: `dup-notify:${fisherman.id}`, session: client, req }
       );
     }
-  });
+  }, session);
 
   await auditService.recordChange({
     action: AUDIT_ACTIONS.CREATE,
+    entityType: 'Fisherman',
     doc: fisherman,
     req,
     metadata: {
@@ -169,7 +180,7 @@ async function create(payload, actor, options = {}) {
   if (duplicates.hasDuplicate) {
     await auditService.record({
       action: AUDIT_ACTIONS.DUPLICATE_FLAGGED,
-      entity: { type: 'Fisherman', id: fisherman._id, label: fisherman.fullName },
+      entity: { type: 'Fisherman', id: fisherman.id, label: fisherman.fullName },
       lga,
       metadata: { matches: duplicates.matches.map((m) => ({ id: m.candidateId, score: m.score })) },
       req,
@@ -186,85 +197,50 @@ async function create(payload, actor, options = {}) {
 const SORTABLE_FIELDS = ['createdAt', 'updatedAt', 'fullName', 'status', 'lga'];
 
 /**
- * Builds the list filter.
+ * Scope for the caller, as the repository expects it.
  *
- * Exported and pure so the authorization behaviour can be unit-tested without
- * a database — the scope-bypass defect this replaced was invisible at the
- * route level and only observable in the composed filter.
- *
- * Every fragment is combined with `andFilters`, never by spreading: the scope
- * fragment for an enumerator is an `$or`, and a later `filter.$or = ...` from
- * the search clause used to overwrite it, silently dropping the scope and
- * exposing the entire state register.
+ * Exported and pure so the authorization behaviour can be unit-tested
+ * without a database. It is a parameter on every read rather than something
+ * each query remembers to add — the defect this replaced was a search clause
+ * overwriting the scope filter and exposing the whole state register, which
+ * was invisible at the route level.
  */
-function buildListFilter(query, actor) {
-  const scope = buildScopeFilter(actor, { cooperativeField: 'cooperative.id' });
-  const conditions = [scope, { isDeleted: { $ne: true } }];
+function scopeFor(actor) {
+  if (isStateWide(actor)) return { stateWide: true };
 
-  const direct = {};
-  if (query.status) {
-    direct.status = Array.isArray(query.status) ? { $in: query.status } : query.status;
+  const scope = { lgas: scopedLgas(actor) };
+  if (actor.role === ROLES.ENUMERATOR) {
+    scope.ownerId = actor.id || actor._id;
+    scope.communities = actor.scope?.communities || [];
   }
-  if (query.lga) {
-    assertCanAccessLga(actor, query.lga);
-    direct.lga = query.lga;
+  if (actor.role === ROLES.COOPERATIVE_OFFICER && actor.cooperative) {
+    scope.cooperativeId = actor.cooperative;
   }
-  if (query.community) direct.community = query.community;
-  if (query.gender) direct.gender = query.gender;
-  if (query.fishermanType) direct.fishermanTypes = query.fishermanType;
-  if (query.fishingType) direct.fishingTypes = query.fishingType;
-  if (query.cooperative) direct['cooperative.id'] = query.cooperative;
-  if (query.registeredBy) direct.registeredBy = query.registeredBy;
-  if (query.hasBlueId === true) direct.blueId = { $exists: true, $ne: null };
-  if (query.hasBlueId === false) direct.blueId = { $in: [null, undefined] };
-  if (query.flagged === true) direct['duplicateFlags.resolution'] = 'PENDING';
-
-  if (query.registeredFrom || query.registeredTo) {
-    direct.createdAt = {};
-    if (query.registeredFrom) direct.createdAt.$gte = query.registeredFrom;
-    if (query.registeredTo) direct.createdAt.$lte = query.registeredTo;
-  }
-  conditions.push(direct);
-
-  // `search` accepts a Blue ID, a phone number or a name.
-  if (query.search) {
-    const term = String(query.search).trim();
-
-    if (blueIdService.isWellFormed(term)) {
-      conditions.push({ blueId: term.toUpperCase() });
-    } else {
-      const { normalizePhone, normalizeNin } = require('../../utils/normalize');
-      const phone = normalizePhone(term);
-      const nin = normalizeNin(term);
-
-      if (phone) {
-        conditions.push({
-          $or: [{ 'match.normalizedPhone': phone }, { 'match.normalizedAltPhone': phone }],
-        });
-      } else if (nin) {
-        // Searched through the blind index — the stored NIN is encrypted.
-        conditions.push({ 'match.ninIndex': fieldCrypto.blindIndex(nin) });
-      } else if (term.length >= 2) {
-        conditions.push({ $text: { $search: term } });
-      }
-    }
-  }
-
-  return andFilters(...conditions);
+  return scope;
 }
 
 /** Lists fishermen within the caller's scope. */
 async function list(query, actor) {
-  const pagination = resolvePagination(query);
-  const filter = buildListFilter(query, actor);
+  const term = String(query.search || '').trim();
+  const search = {};
 
-  return paginate(Fisherman, filter, pagination, {
-    sort: resolveSort(query.sort, SORTABLE_FIELDS, { createdAt: -1 }),
-    select: '-match -nin -verificationToken',
-    populate: [
-      { path: 'community', select: 'name lga type' },
-      { path: 'registeredBy', select: 'firstName lastName role' },
-    ],
+  // Pick the index that fits the term rather than scanning: an exact Blue
+  // ID, an exact normalised phone, a blind-indexed NIN, or the full-text
+  // vector for a name.
+  if (term) {
+    if (blueIdService.isWellFormed(term)) {
+      search.searchBlueId = true;
+    } else {
+      const { normalizePhone, normalizeNin } = require('../../utils/normalize');
+      const phone = normalizePhone(term);
+      const nin = normalizeNin(term);
+      if (phone) search.searchPhone = phone;
+      else if (nin) search.searchNinIndex = fieldCrypto.blindIndex(nin);
+    }
+  }
+
+  return fishermenRepo.list({ ...query, search: term || undefined, ...search }, {
+    scope: scopeFor(actor),
   });
 }
 
@@ -286,32 +262,25 @@ async function getById(
 ) {
   const canReadSensitive = hasPermission(actor, PERMISSIONS.FISHERMAN_READ_SENSITIVE);
 
-  const queryBuilder = Fisherman.findOne({ _id: id, isDeleted: { $ne: true } })
-    .populate('community', 'name lga type')
-    .populate('registeredBy', 'firstName lastName role')
-    .populate('verification.verifiedBy', 'firstName lastName role')
-    .populate('cooperative.id', 'name registrationNumber');
-
-  // `nin` is select:false; only request it when it may actually be disclosed.
-  if (canReadSensitive) queryBuilder.select('+nin');
-
-  const fisherman = await queryBuilder;
+  // The encrypted NIN is only selected by a query that says so, so a caller
+  // without the grant cannot receive it even by accident.
+  const fisherman = await fishermenRepo.findById(id, { withSensitive: canReadSensitive });
 
   if (!fisherman) throw ApiError.notFound('Fisherman not found');
   assertCanAccessRecord(actor, fisherman, { cooperativeField: 'cooperative.id' });
 
-  const result = fisherman.toJSON();
+  const result = { ...fisherman };
 
   if (canReadSensitive && fisherman.nin) {
     if (includeNin) {
-      result.nin = fisherman.getNin();
+      result.nin = revealNin(fisherman);
       // Deliberately awaited: an unlogged read of a NIN is the gap an audit
       // trail exists to close.
       await auditService.record({
         action: AUDIT_ACTIONS.VIEW_SENSITIVE,
         entity: {
           type: 'Fisherman',
-          id: fisherman._id,
+          id: fisherman.id,
           blueId: fisherman.blueId,
           label: fisherman.fullName,
         },
@@ -320,8 +289,14 @@ async function getById(
         req,
       });
     } else {
-      result.ninMasked = fisherman.getMaskedNin();
+      const plain = revealNin(fisherman);
+      result.ninMasked = plain ? fieldCrypto.mask(plain) : undefined;
+      delete result.nin;
     }
+  } else {
+    // Absent entirely rather than null, so a response never hints that a
+    // record has a NIN the caller may not see.
+    delete result.nin;
   }
 
   if (signPhoto && result.photo?.publicId) {
@@ -330,13 +305,10 @@ async function getById(
 
   if (includeAssets) {
     const [boats, engines, equipment, allocations] = await Promise.all([
-      Boat.find({ owner: id, isDeleted: { $ne: true } }).lean(),
-      Engine.find({ owner: id, isDeleted: { $ne: true } }).lean(),
-      Equipment.find({ owner: id, isDeleted: { $ne: true } }).lean(),
-      Allocation.find({ fisherman: id, isDeleted: { $ne: true } })
-        .populate('programme', 'name code type year')
-        .sort({ allocatedAt: -1 })
-        .lean(),
+      boatRepo.findByOwner(id),
+      engineRepo.findByOwner(id),
+      equipmentRepo.findByOwner(id),
+      allocationRepo.findByFisherman(id),
     ]);
     result.boats = boats;
     result.engines = engines;
@@ -348,10 +320,7 @@ async function getById(
 }
 
 async function getByBlueId(blueId, actor, options) {
-  const fisherman = await Fisherman.findOne({
-    blueId: String(blueId).toUpperCase(),
-    isDeleted: { $ne: true },
-  }).select('_id');
+  const fisherman = await fishermenRepo.findByBlueId(blueId);
   if (!fisherman) throw ApiError.notFound('No fisherman found with that Blue ID');
   return getById(fisherman._id, actor, options);
 }
@@ -359,14 +328,14 @@ async function getByBlueId(blueId, actor, options) {
 /** Updates a record. Protected fields are stripped unless the caller is an admin. */
 async function update(id, payload, actor, options = {}) {
   const { req } = options;
-  const fisherman = await Fisherman.findOne({ _id: id, isDeleted: { $ne: true } });
+  const fisherman = await fishermenRepo.findById(id);
   if (!fisherman) throw ApiError.notFound('Fisherman not found');
   assertCanAccessRecord(actor, fisherman, { cooperativeField: 'cooperative.id' });
 
   // An enumerator may only correct a record they captured, and only while it
   // is still unverified — after verification the data is authoritative.
   if (actor.role === ROLES.ENUMERATOR) {
-    if (String(fisherman.registeredBy) !== String(actor._id)) {
+    if (String(fisherman.registeredBy) !== String(actor.id || actor._id)) {
       throw ApiError.forbidden('You can only edit registrations you captured');
     }
     if (fisherman.status === FISHERMAN_STATUS.ACTIVE) {
@@ -374,7 +343,7 @@ async function update(id, payload, actor, options = {}) {
     }
   }
 
-  const before = fisherman.toObject();
+  const before = { ...fisherman };
   const updates = { ...payload };
   for (const field of PROTECTED_FIELDS) delete updates[field];
 
@@ -386,34 +355,39 @@ async function update(id, payload, actor, options = {}) {
     updates.communityName = community?.name;
   }
 
-  Object.assign(fisherman, updates);
+  // Identity changes re-open the duplicate question. Computed from the
+  // payload rather than from a dirty-tracking flag, which no longer exists.
+  const identityTouched = ['firstName', 'middleName', 'lastName', 'phone', 'nin', 'dateOfBirth']
+    .some((f) => updates[f] !== undefined && String(updates[f]) !== String(before[f] ?? ''));
 
-  // Identity changes re-open the duplicate question.
-  const identityTouched = ['firstName', 'middleName', 'lastName', 'phone', 'nin', 'dateOfBirth'].some(
-    (f) => fisherman.isModified(f)
-  );
-
-  await fisherman.save();
+  let updated = await fishermenRepo.update(id, updates, { derive: deriveMatchKeys });
 
   let duplicates = null;
   if (identityTouched) {
-    duplicates = await duplicateService.findDuplicates(fisherman, { excludeId: fisherman._id });
-    if (duplicates.hasDuplicate && fisherman.status !== FISHERMAN_STATUS.ACTIVE) {
-      fisherman.duplicateFlags.push(...duplicateService.buildFlags(duplicates.matches, 'REGISTRATION'));
-      fisherman.status = FISHERMAN_STATUS.DUPLICATE_UNDER_REVIEW;
-      await fisherman.save();
+    duplicates = await duplicateService.findDuplicates(updated, { excludeId: updated.id });
+    if (duplicates.hasDuplicate && updated.status !== FISHERMAN_STATUS.ACTIVE) {
+      await fishermenRepo.addDuplicateFlags(
+        updated.id,
+        duplicateService.buildFlags(duplicates.matches, 'REGISTRATION')
+      );
+      updated = await fishermenRepo.changeStatus(updated.id, {
+        status: FISHERMAN_STATUS.DUPLICATE_UNDER_REVIEW,
+        reason: 'possible duplicate found after an identity change',
+        changedBy: actor.id || actor._id,
+      });
     }
   }
 
   await auditService.recordChange({
     action: AUDIT_ACTIONS.UPDATE,
-    doc: fisherman,
+    entityType: 'Fisherman',
+    doc: updated,
     before,
     req,
   });
   await cache.bumpNamespace(cache.NS.DASHBOARD);
 
-  return { fisherman, duplicates };
+  return { fisherman: updated, duplicates };
 }
 
 /**
@@ -427,7 +401,7 @@ async function verify(id, actor, options = {}) {
   const { req, notes, session = null } = options;
   assertCanVerify(actor);
 
-  const fisherman = await Fisherman.findOne({ _id: id, isDeleted: { $ne: true } });
+  const fisherman = await fishermenRepo.findById(id);
   if (!fisherman) throw ApiError.notFound('Fisherman not found');
   assertCanAccessRecord(actor, fisherman, { cooperativeField: 'cooperative.id' });
 
@@ -437,13 +411,19 @@ async function verify(id, actor, options = {}) {
       details: { blueId: fisherman.blueId },
     });
   }
-  if (fisherman.hasOpenDuplicateFlag()) {
+  /**
+   * An unresolved duplicate blocks verification.
+   *
+   * This is what stops a duplicate acquiring a permanent number and
+   * entering the benefit stream, which is the failure section 10 exists to
+   * prevent and the one that is hardest to unpick afterwards.
+   */
+  const openFlags = await fishermenRepo.listDuplicateFlags(id, { status: 'PENDING' });
+  if (openFlags.length) {
     throw ApiError.conflict('Resolve the outstanding duplicate review before verifying this record', {
       code: 'DUPLICATE_REVIEW_PENDING',
       details: {
-        flags: fisherman.duplicateFlags
-          .filter((f) => f.resolution === 'PENDING')
-          .map((f) => ({ candidate: f.candidate, score: f.score, reasons: f.reasons })),
+        flags: openFlags.map((f) => ({ candidate: f.candidate, score: f.score, reasons: f.reasons })),
       },
     });
   }
@@ -460,35 +440,48 @@ async function verify(id, actor, options = {}) {
    */
   assertNotSelfApproval(actor, fisherman, { actorField: 'registeredBy', action: 'verify' });
 
-  const before = fisherman.toObject();
+  const before = { ...fisherman };
 
   /**
-   * Issuing a Blue ID is the one genuinely irreversible act in the system: the
-   * number is printed on a card and becomes the person's permanent reference.
-   * Allocating the sequence and persisting it must therefore be atomic —
-   * otherwise a failure after allocation silently burns a number, and a
-   * failure after the save leaves assets pointing at nothing.
+   * Issuing a Blue ID is the one genuinely irreversible act in the system:
+   * the number is printed on a card and becomes the person's permanent
+   * reference. Allocating the sequence and persisting it must therefore be
+   * atomic — otherwise a failure after allocation silently burns a number,
+   * and a failure after the write leaves assets pointing at nothing.
    */
-  const blueId = await database.withTransaction(async (txSession) => {
-    const activeSession = session || txSession;
-    const opts = activeSession ? { session: activeSession } : {};
+  let issuedRecord;
+
+  const blueId = await database.withTransaction(async (txClient) => {
+    const client = session || txClient;
 
     /**
-     * Claim the record BEFORE consuming a sequence number.
+     * Take the number first, inside the transaction.
      *
-     * The guard above read a document loaded earlier, so two administrators
-     * verifying the same registration at the same moment both passed it. Both
-     * would then allocate a permanent number and the later save would win —
-     * leaving one Blue ID allocated, never used, and a gap in the sequence,
-     * with two issuance events in the audit trail for one person.
-     *
-     * This conditional update is atomic: exactly one caller can transition the
-     * record out of "no Blue ID", and the loser stops before taking a number.
+     * The counter is transactional, so an abandoned verification gives its
+     * number back rather than leaving a permanent gap in a sequence the
+     * Ministry reads as a count.
      */
-    const claimed = await Fisherman.findOneAndUpdate(
-      { _id: fisherman._id, blueId: { $in: [null, undefined] }, isDeleted: { $ne: true } },
-      { $set: { verification: { verifiedBy: actor._id, verifiedAt: new Date(), notes } } },
-      { new: true, ...opts }
+    const { blueId: issued } = await blueIdService.issue(fisherman.lga, client);
+
+    /**
+     * Attach it conditionally on the record still having none.
+     *
+     * The guard earlier read a record loaded before this call, so two
+     * administrators verifying the same registration at the same moment
+     * both passed it. This UPDATE can only match once; the loser's whole
+     * transaction rolls back, returning its sequence number with it.
+     */
+    const claimed = await fishermenRepo.assignBlueId(
+      fisherman.id,
+      {
+        blueId: issued,
+        // A fresh opaque token for the printed card. Never the Blue ID
+        // itself: a card photographed by a stranger would otherwise hand
+        // over a real identifier.
+        verificationToken: qrService.newToken(),
+        verifiedBy: actor.id || actor._id,
+      },
+      { client }
     );
 
     if (!claimed) {
@@ -497,44 +490,29 @@ async function verify(id, actor, options = {}) {
       });
     }
 
-    const { blueId: issued } = await blueIdService.issue(claimed.lga, activeSession);
+    if (notes) {
+      await fishermenRepo.update(claimed.id, { verificationNotes: notes }, { client });
+    }
 
-    claimed.blueId = issued;
-    claimed.status = FISHERMAN_STATUS.ACTIVE;
-    // A fresh opaque token for the printed card.
-    claimed.rotateVerificationToken();
-    await claimed.save(opts);
+    // Denormalised Blue ID on the assets, so listings and exports never need
+    // a join back to the register.
+    await fishermenRepo.stampBlueIdOnAssets(claimed.id, issued, { client });
 
-    // Denormalised Blue ID on the fisherman's assets, so asset listings and
-    // exports never need a join back to the register.
-    const assetUpdate = { $set: { blueId: issued } };
-    await Promise.all([
-      Boat.updateMany({ owner: claimed._id }, assetUpdate, opts),
-      Engine.updateMany({ owner: claimed._id }, assetUpdate, opts),
-      Equipment.updateMany({ owner: claimed._id }, assetUpdate, opts),
-    ]);
-
-    // Reflect the committed state back onto the caller's document.
-    fisherman.blueId = issued;
-    fisherman.status = claimed.status;
-    fisherman.verification = claimed.verification;
-    fisherman.verificationToken = claimed.verificationToken;
-    fisherman.qrVersion = claimed.qrVersion;
-
+    issuedRecord = claimed;
     return issued;
-  });
+  }, session);
 
   await auditService.record({
     action: AUDIT_ACTIONS.BLUE_ID_ISSUED,
-    entity: { type: 'Fisherman', id: fisherman._id, blueId, label: fisherman.fullName },
-    lga: fisherman.lga,
-    changes: auditService.diff(before, fisherman.toObject()),
+    entity: { type: 'Fisherman', id: issuedRecord.id, blueId, label: issuedRecord.fullName },
+    lga: issuedRecord.lga,
+    changes: auditService.diff(before, issuedRecord),
     metadata: { notes },
     req,
   });
   await cache.bumpNamespace(cache.NS.DASHBOARD);
 
-  return fisherman;
+  return issuedRecord;
 }
 
 /** Changes lifecycle status (suspend, mark deceased, reactivate). */
