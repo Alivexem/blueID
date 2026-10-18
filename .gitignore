@@ -60,11 +60,16 @@ coverage/
 tmp/
 temp/
 
-# Generated artefacts (exports, QR codes, backups)
-storage/
-uploads/
-exports/
-backups/
+# Generated artefacts (exports, QR codes, backups).
+#
+# Anchored with a leading slash so they match ONLY at the repository root.
+# A bare `storage/` also matched src/services/storage/, which silently kept
+# the entire media driver out of every commit — the app did not boot from a
+# fresh clone, and nothing said why.
+/storage/
+/uploads/
+/exports/
+/backups/
 
 # ---------------------------------------------------------------------------
 # Editors & OS

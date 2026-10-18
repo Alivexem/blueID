@@ -132,10 +132,16 @@ const schema = z
     /**
      * Where images live.
      *
-     *   local       the server's own filesystem (data stays in-country)
-     *   cloudinary  the managed service
+     *   cloudinary  the managed service (this deployment's default)
+     *   local       the server's own filesystem
+     *
+     * `local` exists for a deployment that must keep citizen photographs
+     * inside Nigeria — NITDA's National Cloud Policy puts identity data in a
+     * tier that has to be stored in-country at rest. This build hosts with
+     * Cloudinary by the client's decision; switching is one variable, and
+     * src/scripts/migrateMedia.js moves the existing images.
      */
-    MEDIA_DRIVER: z.enum(['local', 'cloudinary']).default('local'),
+    MEDIA_DRIVER: z.enum(['local', 'cloudinary']).default('cloudinary'),
     /** Absolute path, deliberately OUTSIDE the deploy directory. */
     MEDIA_ROOT: z.string().default('/var/lib/blueid/media'),
     /** Signs delivery URLs. Must differ from every other secret. */
