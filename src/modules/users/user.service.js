@@ -121,13 +121,24 @@ async function invite(payload, actor, options = {}) {
     req,
   });
 
-  // Delivery failure must not fail the invitation — the account exists either way.
+  /**
+   * Delivery failure must not fail the invitation — the account exists either
+   * way, and the password is still returned below for the administrator to
+   * pass on by hand.
+   *
+   * The temporary password goes in the message. Without it the recipient was
+   * told an account existed, handed a link, and left with no way to sign in.
+   * It is safe to send because the account is flagged `mustChangePassword`,
+   * so the credential cannot be used for anything but replacing itself.
+   */
   emailService
     .sendOfficerInvite({
       to: user.email,
       name: user.fullName,
       role: user.role,
       invitedBy: actor.fullName,
+      temporaryPassword,
+      userId: user.staffId,
     })
     .catch(() => {});
 
