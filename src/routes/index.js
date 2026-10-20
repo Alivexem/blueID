@@ -39,7 +39,7 @@ router.get('/', (req, res) => {
       fishermen: `${config.app.apiPrefix}/fishermen`,
       boats: `${config.app.apiPrefix}/boats`,
       engines: `${config.app.apiPrefix}/engines`,
-      equipment: `${config.app.apiPrefix}/equipment`,
+      equipment: `${config.app.apiPrefix}/equipments`,
       communities: `${config.app.apiPrefix}/communities`,
       cooperatives: `${config.app.apiPrefix}/cooperatives`,
       programmes: `${config.app.apiPrefix}/programmes`,
@@ -80,6 +80,19 @@ router.use('/users', userRoutes);
 router.use('/fishermen', fishermanRoutes);
 router.use('/boats', boatRoutes);
 router.use('/engines', engineRoutes);
+/**
+ * Equipment is mounted at the plural path, like every other collection here.
+ *
+ * It was `/equipment` alone, while the OpenAPI spec, the Swagger page and the
+ * frontend guide all documented `/equipments` — so a client written from the
+ * documentation got `404 ROUTE_NOT_FOUND` on the one resource whose name is
+ * a mass noun, and nothing else. A frontend developer hit it; the route
+ * contract test alongside this now catches it.
+ *
+ * The singular path stays as an alias so anything already calling it keeps
+ * working. `/equipments` is the documented one.
+ */
+router.use('/equipments', equipmentRoutes);
 router.use('/equipment', equipmentRoutes);
 router.use('/assets', ownerRoutes);
 router.use('/communities', communityRoutes);
