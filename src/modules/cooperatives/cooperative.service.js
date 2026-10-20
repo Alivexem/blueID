@@ -115,13 +115,41 @@ async function listMembers(id, query, actor) {
 }
 
 /** Adds a fisherman to a cooperative. */
+/**
+ * Resolves whichever fisherman identifier the caller had to hand.
+ *
+ * These routes accepted only the 24-character database id, which is an
+ * internal detail nobody outside the system ever sees. What a cooperative
+ * officer actually holds is the Blue ID — it is printed on the card, encoded
+ * in the QR code, and is how a person is identified everywhere else in this
+ * API, including `GET /fishermen/blue-id/{blueId}`. Sending it here was
+ * rejected at validation, so adding a member required a lookup the client
+ * should never have needed to make.
+ *
+ * The two forms cannot be confused: a database id is exactly 24 hex
+ * characters, a Blue ID is `CRS-BLU-<LGA>-<NNNN>`. Anything else resolves to
+ * nothing and answers 404, the same as an id for a record outside the
+ * caller's scope — the distinction is deliberately not observable.
+ *
+ * Note this only widens the lookup. The scope check on the record that comes
+ * back is unchanged and still applies.
+ */
+async function findFishermanByRef(reference, extra = {}) {
+  const raw = String(reference || '').trim();
+  const query = /^[0-9a-fA-F]{24}$/.test(raw)
+    ? { _id: raw }
+    : { blueId: raw.toUpperCase() };
+
+  return Fisherman.findOne({ ...query, ...extra });
+}
+
 async function addMember(id, { fishermanId, membershipNumber }, actor, options = {}) {
   const { req } = options;
   const cooperative = await Cooperative.findOne({ _id: id, isDeleted: { $ne: true } });
   if (!cooperative) throw ApiError.notFound('Cooperative not found');
   assertCanAccessLga(actor, cooperative.lga);
 
-  const fisherman = await Fisherman.findOne({ _id: fishermanId, isDeleted: { $ne: true } });
+  const fisherman = await findFishermanByRef(fishermanId, { isDeleted: { $ne: true } });
   if (!fisherman) throw ApiError.notFound('Fisherman not found');
   assertCanAccessLga(actor, fisherman.lga);
 
@@ -155,7 +183,7 @@ async function addMember(id, { fishermanId, membershipNumber }, actor, options =
 
 async function removeMember(id, fishermanId, actor, options = {}) {
   const { req, reason } = options;
-  const fisherman = await Fisherman.findOne({ _id: fishermanId, 'cooperative.id': id });
+  const fisherman = await findFishermanByRef(fishermanId, { 'cooperative.id': id });
   if (!fisherman) throw ApiError.notFound('That fisherman is not a member of this cooperative');
   assertCanAccessLga(actor, fisherman.lga);
 

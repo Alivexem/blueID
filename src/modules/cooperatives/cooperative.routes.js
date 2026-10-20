@@ -18,6 +18,35 @@ router.use(authenticate);
 
 const objectId = z.string().regex(/^[0-9a-fA-F]{24}$/);
 
+/**
+ * A fisherman, named either way round.
+ *
+ * `objectId` alone meant a client had to know the 24-character database id,
+ * which nothing outside the system publishes. The identifier an officer
+ * holds is the Blue ID from the card — `CRS-BLU-BAK-0001` — and it was
+ * rejected here at validation before any lookup happened.
+ *
+ * Both shapes are matched explicitly rather than accepting any string, so a
+ * malformed reference is still a 422 that names the field, instead of a 404
+ * that leaves the caller guessing whether the person simply does not exist.
+ */
+const fishermanRef = z
+  .string()
+  .trim()
+  .refine(
+    (value) =>
+      /^[0-9a-fA-F]{24}$/.test(value) ||
+      /**
+       * The four segments of a Blue ID: prefix, segment, LGA, sequence. The
+       * letters are not pinned to CRS-BLU because the prefix and segment are
+       * configurable (BLUE_ID_PREFIX, BLUE_ID_SEGMENT), and the sequence
+       * width follows BLUE_ID_SEQUENCE_PADDING — so the shape is matched,
+       * not the current deployment's particular values.
+       */
+      /^[A-Za-z]{2,6}-[A-Za-z]{2,6}-[A-Za-z]{2,4}-\d{3,8}$/.test(value),
+    { message: 'Provide a fisherman id or a Blue ID such as CRS-BLU-BAK-0001' }
+  );
+
 const createCooperative = z.object({
   name: z.string().trim().min(3).max(160),
   registrationNumber: z.string().trim().max(40).optional(),
@@ -60,7 +89,7 @@ const listCooperatives = z.object({
 });
 
 const idParam = z.object({ id: objectId });
-const memberParams = z.object({ id: objectId, fishermanId: objectId });
+const memberParams = z.object({ id: objectId, fishermanId: fishermanRef });
 
 router
   .route('/')
@@ -129,7 +158,7 @@ router.post(
   validate({
     params: idParam,
     body: z.object({
-      fishermanId: objectId,
+      fishermanId: fishermanRef,
       membershipNumber: z.string().trim().max(40).optional(),
     }),
   }),

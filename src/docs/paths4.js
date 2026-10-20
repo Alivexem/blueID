@@ -114,17 +114,47 @@ module.exports = {
     get: { tags: ['Cooperatives'], summary: 'List members', parameters: [idParam(), ...pageParams],
       responses: { 200: listJson('Members.', ref('Fisherman')), 401: R[401], 403: R[403], 404: R[404] } },
     post: { tags: ['Cooperatives'], summary: 'Add a member',
-      description: 'Refused if the fisherman already belongs to another society.' + needs('cooperative:manage'),
+      description:
+        'Refused if the fisherman already belongs to another society.\n\n' +
+        '**`fishermanId` takes either identifier** — the 24-character record id, or the Blue ID printed on the card and encoded in the QR code, such as `CRS-BLU-BAK-0001`. The Blue ID is matched case-insensitively. Use whichever one you have; there is no need to look the record up first.\n\n' +
+        'An identifier that matches nothing answers `404`, exactly as one for a record outside your scope does — the two are deliberately indistinguishable.' +
+        needs('cooperative:manage'),
       parameters: [idParam()],
-      requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['fishermanId'],
-        properties: { fishermanId: { type: 'string', format: 'objectid' }, membershipNumber: { type: 'string' } } } } } },
+      requestBody: {
+        required: true,
+        content: {
+          'application/json': {
+            schema: {
+              type: 'object',
+              required: ['fishermanId'],
+              properties: {
+                fishermanId: {
+                  type: 'string',
+                  description: 'A fisherman record id, or a Blue ID.',
+                  example: 'CRS-BLU-BAK-0001',
+                },
+                membershipNumber: { type: 'string' },
+              },
+            },
+            examples: {
+              byBlueId: { summary: 'By the number on the card', value: { fishermanId: 'CRS-BLU-BAK-0001' } },
+              byRecordId: { summary: 'By record id', value: { fishermanId: '6ad729b644f3abd07c84b0de' } },
+            },
+          },
+        },
+      },
       responses: { 200: okJson('Added.', ref('Fisherman')), 401: R[401], 403: R[403], 404: R[404], 409: R[409] } },
   },
 
   '/api/v1/cooperatives/{id}/members/{fishermanId}': {
     delete: { tags: ['Cooperatives'], summary: 'Remove a member',
-      parameters: [idParam(), idParam('fishermanId')],
-      description: needs('cooperative:manage').trim(),
+      parameters: [
+        idParam(),
+        { name: 'fishermanId', in: 'path', required: true, schema: { type: 'string' },
+          description: 'A fisherman record id, or the Blue ID from the card. Matched case-insensitively.',
+          example: 'CRS-BLU-BAK-0001' },
+      ],
+      description: 'Accepts either a record id or a Blue ID.' + needs('cooperative:manage'),
       requestBody: { content: { 'application/json': { schema: { type: 'object', properties: { reason: { type: 'string' } } } } } },
       responses: { 204: { description: 'Removed.' }, 401: R[401], 403: R[403], 404: R[404] } },
   },

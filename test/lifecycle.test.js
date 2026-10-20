@@ -291,3 +291,120 @@ dbTest('an allocation cannot be moved to a different programme', async () => {
 
   await Allocation.collection.deleteMany({ programme });
 });
+
+// ---------------------------------------------------------------------------
+// Cooperative membership by Blue ID
+// ---------------------------------------------------------------------------
+
+/**
+ * A cooperative officer holds the Blue ID, not the database id.
+ *
+ * `POST /cooperatives/{id}/members` accepted only the 24-character `_id`,
+ * which nothing outside the system publishes. Sending `CRS-BLU-BAK-0001` —
+ * the number printed on the card and encoded in the QR — was rejected at
+ * validation, so the client had to resolve it first through a separate
+ * endpoint to do something it already had the identifier for.
+ *
+ * These go through the real service, because the fix is a lookup change and
+ * asserting on a regex would not prove a member was actually added.
+ */
+dbTest('a fisherman can be added to a cooperative by Blue ID or by id', async () => {
+  const Fisherman = require('../src/modules/fishermen/fisherman.model');
+  const Cooperative = require('../src/modules/cooperatives/cooperative.model');
+  const service = require('../src/modules/cooperatives/cooperative.service');
+  const { USER_STATUS } = require('../src/config/constants');
+
+  const stamp = crypto.randomBytes(4).toString('hex');
+  const actor = {
+    _id: new (require('mongoose').Types.ObjectId)(),
+    role: ROLES.STATE_ADMIN,
+    status: USER_STATUS.ACTIVE,
+    scope: { lgas: [] },
+    fullName: 'Coop Probe',
+  };
+
+  const society = await Cooperative.create({
+    name: `Probe Society ${stamp}`,
+    lga: 'BAK',
+    registrationNumber: `PRB-${stamp}`,
+  });
+
+  const base = {
+    gender: 'MALE',
+    estimatedYearOfBirth: 1980,
+    lga: 'BAK',
+    fishermanTypes: ['ARTISANAL'],
+  };
+
+  const byBlueId = await Fisherman.create({
+    ...base, firstName: 'Blue', lastName: `Ref${stamp}`,
+    blueId: `CRS-BLU-BAK-9${stamp.slice(0, 3).replace(/\D/g, '0').padEnd(3, '0')}`,
+  });
+  const byObjectId = await Fisherman.create({ ...base, firstName: 'Id', lastName: `Ref${stamp}` });
+
+  const cleanup = async () => {
+    await Fisherman.deleteMany({ _id: { $in: [byBlueId._id, byObjectId._id] } });
+    await Cooperative.deleteOne({ _id: society._id });
+  };
+
+  try {
+    // The identifier an officer actually has.
+    const added = await service.addMember(
+      society._id,
+      { fishermanId: byBlueId.blueId },
+      actor,
+      {}
+    );
+    assert.equal(
+      String(added._id),
+      String(byBlueId._id),
+      'a Blue ID must resolve to the fisherman it identifies'
+    );
+    assert.equal(String(added.cooperative.id), String(society._id), 'and the membership must stick');
+
+    // Lower case, as somebody will inevitably type it.
+    const removedThenRe = await service.removeMember(society._id, byBlueId.blueId.toLowerCase(), actor, {});
+    assert.ok(removedThenRe, 'Blue ID lookup must be case-insensitive');
+
+    // The original form still works — this widens the input, it does not move it.
+    const second = await service.addMember(
+      society._id,
+      { fishermanId: String(byObjectId._id) },
+      actor,
+      {}
+    );
+    assert.equal(String(second._id), String(byObjectId._id), 'the database id must still be accepted');
+  } finally {
+    await cleanup();
+  }
+});
+
+dbTest('an unknown Blue ID is not found, and says nothing more', async () => {
+  const service = require('../src/modules/cooperatives/cooperative.service');
+  const Cooperative = require('../src/modules/cooperatives/cooperative.model');
+  const { USER_STATUS } = require('../src/config/constants');
+
+  const stamp = crypto.randomBytes(4).toString('hex');
+  const actor = {
+    _id: new (require('mongoose').Types.ObjectId)(),
+    role: ROLES.STATE_ADMIN,
+    status: USER_STATUS.ACTIVE,
+    scope: { lgas: [] },
+    fullName: 'Coop Probe',
+  };
+  const society = await Cooperative.create({
+    name: `Probe Society ${stamp}`,
+    lga: 'BAK',
+    registrationNumber: `PRB2-${stamp}`,
+  });
+
+  try {
+    await assert.rejects(
+      () => service.addMember(society._id, { fishermanId: 'CRS-BLU-BAK-9999' }, actor, {}),
+      (err) => err.statusCode === 404,
+      'a Blue ID nobody holds must be a 404, like an id outside the caller’s scope'
+    );
+  } finally {
+    await Cooperative.deleteOne({ _id: society._id });
+  }
+});
